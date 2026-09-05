@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -317,11 +318,27 @@ assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
 assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
 
 const upstreamPaths = [];
+let release = 'one';
+const remoteFiles = () => ({
+  'index.html': '<!doctype html><script src="asset.js"></script>',
+  'asset.js': `globalThis.sidequeryRemoteFixture = '${release}';`,
+});
 const upstream = createServer((request, response) => {
   upstreamPaths.push(request.url);
-  if (request.url === '/notebook/asset.js') {
-    response.setHeader('content-type', 'text/javascript');
-    response.end('globalThis.sidequeryRemoteFixture = true;');
+  if (request.url === '/notebook/manifest.json') {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      version: release === 'one' ? '1111111' : '2222222',
+      bridgeVersion: 1,
+      files: Object.entries(remoteFiles()).sort(([a], [b]) => a.localeCompare(b)).map(([path, body]) => ({
+        path, size: Buffer.byteLength(body), sha256: createHash('sha256').update(body).digest('hex'),
+      })),
+    }));
+    return;
+  }
+  const asset = remoteFiles()[request.url?.replace('/notebook/', '')];
+  if (asset !== undefined) {
+    response.end(asset);
     return;
   }
   response.statusCode = 404;
@@ -335,11 +352,23 @@ const remoteRows = await runSQL(
 const remote = JSON.parse(firstValue(remoteRows));
 const remoteAsset = await fetch(`${remote.baseUrl}/asset.js`);
 assert.equal(remoteAsset.status, 200);
-assert.match(await remoteAsset.text(), /sidequeryRemoteFixture/);
+assert.match(await remoteAsset.text(), /sidequeryRemoteFixture = 'one'/);
 assert.equal((await fetch(`${remote.baseUrl}/../outside`)).status, 404);
-assert.deepEqual(upstreamPaths, ['/notebook/asset.js', '/notebook/outside']);
+assert(upstreamPaths.includes('/notebook/manifest.json'));
+assert(!upstreamPaths.includes('/notebook/outside'));
+assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
+release = 'two';
+const updatedUi = JSON.parse(firstValue(await runSQL(
+  `select sidequery_ui_start('http://127.0.0.1:${upstreamPort}/notebook/', '', 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+)));
+assert.match(await (await fetch(`${updatedUi.baseUrl}/asset.js`)).text(), /sidequeryRemoteFixture = 'two'/);
 assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
 await new Promise((resolve) => upstream.close(resolve));
+const offline = JSON.parse(firstValue(await runSQL(
+  `select sidequery_ui_start('http://127.0.0.1:${upstreamPort}/notebook/', '', 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+)));
+assert.match(await (await fetch(`${offline.baseUrl}/asset.js`)).text(), /sidequeryRemoteFixture = 'two'/);
+assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
 
 const externalAccessDisabled = spawnSync(
   duckdb,

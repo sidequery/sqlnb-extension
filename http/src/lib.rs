@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
@@ -25,7 +25,7 @@ use std::{
     ptr,
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
@@ -36,6 +36,12 @@ compile_error!("sidequery-ui-http currently supports macOS and Linux");
 
 const MAX_QUACK_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NOTEBOOK_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ASSET_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_ASSET_FILES: usize = 2048;
+const MAX_ASSET_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ASSET_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
+const ASSET_BRIDGE_VERSION: u32 = 1;
+const ASSET_UPDATE_BUDGET: Duration = Duration::from_secs(60);
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 #[derive(Debug, Deserialize)]
@@ -59,14 +65,25 @@ struct AppState {
     duckdb_version: String,
     quack_url: Url,
     client: reqwest::Client,
-    assets: AssetSource,
+    assets: PathBuf,
     notebooks: Arc<NotebookStore>,
 }
 
-#[derive(Clone)]
-enum AssetSource {
-    Local(PathBuf),
-    Remote(Url),
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetManifest {
+    version: String,
+    bridge_version: u32,
+    #[serde(default)]
+    asset_base: String,
+    files: Vec<AssetManifestFile>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AssetManifestFile {
+    path: String,
+    sha256: String,
+    size: u64,
 }
 
 struct NotebookStore {
@@ -216,12 +233,12 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         if !path.is_absolute() || !path.is_dir() {
             return Err("local asset directory must be an existing absolute directory".into());
         }
-        AssetSource::Local(
-            path.canonicalize()
-                .map_err(|error| format!("failed to resolve local asset directory: {error}"))?,
-        )
+        path.canonicalize()
+            .map_err(|error| format!("failed to resolve local asset directory: {error}"))?
     } else if !config.remote_asset_url.is_empty() {
-        AssetSource::Remote(parse_remote_asset_url(&config.remote_asset_url)?)
+        let remote = parse_remote_asset_url(&config.remote_asset_url)?;
+        let cache = default_asset_cache_scope(&remote)?;
+        resolve_remote_assets(&remote, &cache)?
     } else {
         return Err("remote asset URL or local asset directory is required".into());
     };
@@ -295,6 +312,449 @@ fn parse_remote_asset_url(value: &str) -> Result<Url, String> {
         url.set_path(&path);
     }
     Ok(url)
+}
+
+fn default_asset_cache_scope(remote: &Url) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is unavailable; cannot locate UI cache")?;
+    #[cfg(target_os = "macos")]
+    let root = PathBuf::from(home)
+        .join("Library")
+        .join("Caches")
+        .join("sidequery")
+        .join("sqlnb-extension")
+        .join("ui");
+    #[cfg(target_os = "linux")]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(home).join(".cache"))
+        .join("sidequery")
+        .join("sqlnb-extension")
+        .join("ui");
+    Ok(root.join(revision(remote.as_str().as_bytes())))
+}
+
+fn resolve_remote_assets(remote: &Url, cache_scope: &Path) -> Result<PathBuf, String> {
+    resolve_remote_assets_with_budget(remote, cache_scope, ASSET_UPDATE_BUDGET)
+}
+
+fn resolve_remote_assets_with_budget(
+    remote: &Url,
+    cache_scope: &Path,
+    budget: Duration,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(cache_scope)
+        .map_err(|error| format!("failed to create UI cache: {error}"))?;
+    let fallback = load_active_generation(cache_scope);
+    match fetch_and_activate_generation(remote, cache_scope, budget) {
+        Ok(generation) => Ok(generation),
+        Err(update_error) => match fallback {
+            Ok(generation) => Ok(generation),
+            Err(cache_error) => Err(format!(
+                "failed to update Sidequery UI assets ({update_error}); no valid cached UI is available ({cache_error})"
+            )),
+        },
+    }
+}
+
+fn asset_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("failed to build UI asset client: {error}"))
+}
+
+fn fetch_and_activate_generation(
+    remote: &Url,
+    cache_scope: &Path,
+    budget: Duration,
+) -> Result<PathBuf, String> {
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or("invalid UI update budget")?;
+    let client = asset_client()?;
+    let manifest_url = scoped_remote_url(remote, "manifest.json")?;
+    let manifest_bytes = fetch_limited(
+        &client,
+        manifest_url,
+        MAX_ASSET_MANIFEST_BYTES as u64,
+        "UI manifest",
+        deadline,
+    )?;
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid UI manifest JSON: {error}"))?;
+    validate_asset_manifest(&manifest)?;
+
+    let generations = cache_scope.join("generations");
+    fs::create_dir_all(&generations)
+        .map_err(|error| format!("failed to create UI generations cache: {error}"))?;
+
+    // A repaired generation has a distinct cache ID while retaining the
+    // manifest's version. Reuse that active immutable copy when it matches the
+    // newly fetched manifest instead of repairing the original on every start.
+    if let Ok(active) = load_active_generation(cache_scope) {
+        let active_id = active
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or("cached UI generation has an invalid directory name")?;
+        if validate_cache_id_for_version(active_id, &manifest.version).is_ok() {
+            validate_cached_generation(&active, Some(&manifest))?;
+            return Ok(active);
+        }
+    }
+
+    let mut cache_id = manifest.version.clone();
+    let mut generation = generations.join(&cache_id);
+    if generation.exists() {
+        match validate_cached_generation(&generation, None) {
+            Ok(()) => {
+                // A version names immutable contents. A valid cached manifest
+                // with different contents is an invalid remote update, not
+                // disk corruption that may be repaired under another ID.
+                validate_cached_generation(&generation, Some(&manifest))?;
+                activate_generation(cache_scope, &cache_id)?;
+                return Ok(generation);
+            }
+            Err(_) => {
+                // Never mutate or remove a generation that another running
+                // server may have pinned. A repaired copy gets a distinct
+                // immutable cache ID.
+                cache_id = format!("{}-{}", manifest.version, uuid::Uuid::new_v4().simple());
+                generation = generations.join(&cache_id);
+            }
+        }
+    }
+
+    let staging = cache_scope.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("failed to create UI staging directory: {error}"))?;
+    let download = (|| {
+        for file in &manifest.files {
+            let relative = validate_asset_path(&file.path)?;
+            let destination = staging.join(&relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create UI asset directory: {error}"))?;
+            }
+            let remote_path = format!("{}{}", manifest.asset_base, file.path);
+            let url = scoped_remote_url(remote, &remote_path)?;
+            let bytes = fetch_limited(
+                &client,
+                url,
+                file.size,
+                &format!("UI asset {}", file.path),
+                deadline,
+            )?;
+            if bytes.len() as u64 != file.size {
+                return Err(format!(
+                    "UI asset {} has size {}, expected {}",
+                    file.path,
+                    bytes.len(),
+                    file.size
+                ));
+            }
+            let actual_hash = revision(&bytes);
+            if actual_hash != file.sha256 {
+                return Err(format!(
+                    "UI asset {} failed SHA-256 verification",
+                    file.path
+                ));
+            }
+            write_new_file(&destination, &bytes)?;
+        }
+        let stored_manifest = serde_json::to_vec(&manifest)
+            .map_err(|error| format!("failed to serialize UI manifest: {error}"))?;
+        write_new_file(&staging.join("manifest.json"), &stored_manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = download {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    match fs::rename(&staging, &generation) {
+        Ok(()) => {}
+        Err(error) if generation.exists() => {
+            let _ = fs::remove_dir_all(&staging);
+            validate_cached_generation(&generation, Some(&manifest)).map_err(|validation| {
+                format!("UI generation cache collision ({error}); existing generation is invalid: {validation}")
+            })?;
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!("failed to commit UI generation: {error}"));
+        }
+    }
+    activate_generation(cache_scope, &cache_id)?;
+    Ok(generation)
+}
+
+fn fetch_limited(
+    client: &reqwest::blocking::Client,
+    url: Url,
+    limit: u64,
+    label: &str,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "Sidequery UI asset update exceeded its overall budget".to_string())?;
+    let response = client
+        .get(url)
+        .timeout(remaining.min(Duration::from_secs(30)))
+        .send()
+        .map_err(|error| format!("failed to fetch {label}: {error:?}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to fetch {label}: HTTP {}",
+            response.status()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(format!("{label} exceeds its size limit"));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {label}: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("{label} exceeds its size limit"));
+    }
+    Ok(bytes)
+}
+
+fn validate_asset_manifest(manifest: &AssetManifest) -> Result<(), String> {
+    if manifest.bridge_version != ASSET_BRIDGE_VERSION {
+        return Err(format!(
+            "UI manifest bridgeVersion {} is incompatible with bridgeVersion {}",
+            manifest.bridge_version, ASSET_BRIDGE_VERSION
+        ));
+    }
+    if manifest.version.len() < 7
+        || manifest.version.len() > 64
+        || !manifest
+            .version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "UI manifest version must be a 7-64 character lowercase hexadecimal SHA".into(),
+        );
+    }
+    if !manifest.asset_base.is_empty() && manifest.asset_base != format!("{}/", manifest.version) {
+        return Err("UI manifest assetBase must be empty or exactly <version>/".into());
+    }
+    if manifest.files.is_empty() || manifest.files.len() > MAX_ASSET_FILES {
+        return Err(format!(
+            "UI manifest must contain 1-{MAX_ASSET_FILES} files"
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    let mut total_size = 0u64;
+    let mut has_index = false;
+    for file in &manifest.files {
+        validate_asset_path(&file.path)?;
+        if file.path == "manifest.json" {
+            return Err("UI manifest must not include itself".into());
+        }
+        if previous.is_some_and(|path| path >= file.path.as_str()) {
+            return Err("UI manifest files must be unique and sorted lexically".into());
+        }
+        previous = Some(&file.path);
+        if file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!("UI asset {} has an invalid SHA-256", file.path));
+        }
+        if file.size > MAX_ASSET_FILE_BYTES {
+            return Err(format!("UI asset {} exceeds the size limit", file.path));
+        }
+        total_size = total_size
+            .checked_add(file.size)
+            .ok_or("UI manifest total size overflow")?;
+        if total_size > MAX_ASSET_GENERATION_BYTES {
+            return Err("UI generation exceeds the total size limit".into());
+        }
+        has_index |= file.path == "index.html";
+    }
+    if !has_index {
+        return Err("UI manifest must include index.html".into());
+    }
+    Ok(())
+}
+
+fn validate_asset_path(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty()
+        || value.contains('\\')
+        || value.contains('\0')
+        || value.split('/').any(|segment| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(format!("invalid UI asset path: {value}"));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("invalid UI asset path: {value}"));
+    }
+    Ok(path)
+}
+
+fn scoped_remote_url(remote: &Url, relative: &str) -> Result<Url, String> {
+    let joined = remote
+        .join(relative)
+        .map_err(|error| format!("invalid UI asset URL: {error}"))?;
+    if joined.scheme() != remote.scheme()
+        || joined.host_str() != remote.host_str()
+        || joined.port_or_known_default() != remote.port_or_known_default()
+        || !joined.path().starts_with(remote.path())
+        || joined.query().is_some()
+        || joined.fragment().is_some()
+    {
+        return Err("UI asset URL escaped the configured remote base".into());
+    }
+    Ok(joined)
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "failed to create cached UI asset {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(bytes).map_err(|error| {
+        format!(
+            "failed to write cached UI asset {}: {error}",
+            path.display()
+        )
+    })?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync cached UI asset {}: {error}", path.display()))
+}
+
+fn activate_generation(cache_scope: &Path, cache_id: &str) -> Result<(), String> {
+    let temporary = cache_scope.join(format!(".current-{}", uuid::Uuid::new_v4()));
+    write_new_file(&temporary, cache_id.as_bytes())?;
+    fs::rename(&temporary, cache_scope.join("current")).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("failed to activate cached UI generation: {error}")
+    })
+}
+
+fn load_active_generation(cache_scope: &Path) -> Result<PathBuf, String> {
+    let cache_id = fs::read_to_string(cache_scope.join("current"))
+        .map_err(|error| format!("failed to read active UI generation: {error}"))?;
+    validate_cache_id(&cache_id)?;
+    let generation = cache_scope.join("generations").join(cache_id);
+    validate_cached_generation(&generation, None)?;
+    Ok(generation)
+}
+
+fn validate_cached_generation(
+    generation: &Path,
+    expected: Option<&AssetManifest>,
+) -> Result<(), String> {
+    let manifest_bytes = fs::read(generation.join("manifest.json"))
+        .map_err(|error| format!("failed to read cached UI manifest: {error}"))?;
+    if manifest_bytes.len() > MAX_ASSET_MANIFEST_BYTES {
+        return Err("cached UI manifest exceeds its size limit".into());
+    }
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid cached UI manifest: {error}"))?;
+    validate_asset_manifest(&manifest)?;
+    let cache_id = generation
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("cached UI generation has an invalid directory name")?;
+    validate_cache_id_for_version(cache_id, &manifest.version)?;
+    if let Some(expected) = expected {
+        let cached = serde_json::to_vec(&manifest)
+            .map_err(|error| format!("failed to compare cached UI manifest: {error}"))?;
+        let requested = serde_json::to_vec(expected)
+            .map_err(|error| format!("failed to compare remote UI manifest: {error}"))?;
+        if cached != requested {
+            return Err("remote UI manifest changed without a new version".into());
+        }
+    }
+    for file in &manifest.files {
+        let relative = validate_asset_path(&file.path)?;
+        let path = generation.join(relative);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect cached UI asset {}: {error}", file.path))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != file.size {
+            return Err(format!(
+                "cached UI asset {} has invalid metadata",
+                file.path
+            ));
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("failed to read cached UI asset {}: {error}", file.path))?;
+        if revision(&bytes) != file.sha256 {
+            return Err(format!(
+                "cached UI asset {} failed SHA-256 verification",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache_id(cache_id: &str) -> Result<(), String> {
+    let (version, repair) = cache_id
+        .split_once('-')
+        .map_or((cache_id, None), |(version, repair)| {
+            (version, Some(repair))
+        });
+    if version.len() < 7
+        || version.len() > 64
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || repair.is_some_and(|value| {
+            value.len() != 32
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err("active UI generation has an invalid cache ID".into());
+    }
+    Ok(())
+}
+
+fn validate_cache_id_for_version(cache_id: &str, version: &str) -> Result<(), String> {
+    validate_cache_id(cache_id)?;
+    if cache_id == version
+        || cache_id
+            .strip_prefix(version)
+            .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() == 33)
+    {
+        Ok(())
+    } else {
+        Err("cached UI generation version does not match its cache ID".into())
+    }
 }
 
 fn notebook_root(configured: &str) -> Result<PathBuf, String> {
@@ -1268,64 +1728,24 @@ async fn static_asset(
         ));
     }
     let path = if path.is_empty() { "index.html" } else { path };
-    match &state.assets {
-        AssetSource::Local(root) => {
-            let file = root.join(path);
-            let canonical = file.canonicalize().map_err(|_| {
-                ApiError::new(StatusCode::NOT_FOUND, "not_found", "asset does not exist")
-            })?;
-            if !canonical.starts_with(root) || !canonical.is_file() {
-                return Err(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "asset does not exist",
-                ));
-            }
-            let bytes = tokio::fs::read(&canonical).await.map_err(|_| {
-                ApiError::new(StatusCode::NOT_FOUND, "not_found", "asset does not exist")
-            })?;
-            let mime = mime_guess::from_path(&canonical)
-                .first_or_octet_stream()
-                .to_string();
-            Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response())
-        }
-        AssetSource::Remote(base) => {
-            let url = base.join(path).map_err(|_| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_asset_path",
-                    "invalid asset path",
-                )
-            })?;
-            let upstream = state
-                .client
-                .get(url)
-                .timeout(Duration::from_secs(30))
-                .send()
-                .await
-                .map_err(|_| {
-                    ApiError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "asset_unavailable",
-                        "remote UI asset is unavailable",
-                    )
-                })?;
-            let status = upstream.status();
-            let content_type = upstream
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
-            let bytes = upstream.bytes().await.map_err(|_| {
-                ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "asset_unavailable",
-                    "remote UI asset is unavailable",
-                )
-            })?;
-            Ok((status, [(header::CONTENT_TYPE, content_type)], bytes).into_response())
-        }
+    let file = state.assets.join(path);
+    let canonical = file
+        .canonicalize()
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "not_found", "asset does not exist"))?;
+    if !canonical.starts_with(&state.assets) || !canonical.is_file() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "asset does not exist",
+        ));
     }
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "not_found", "asset does not exist"))?;
+    let mime = mime_guess::from_path(&canonical)
+        .first_or_octet_stream()
+        .to_string();
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response())
 }
 
 fn router(state: AppState) -> Router {
