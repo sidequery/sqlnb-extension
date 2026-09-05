@@ -1,10 +1,321 @@
 use super::*;
 use axum::http::Request;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::io::{BufRead, BufReader};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::unix::fs::symlink;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+type AssetRoutes = Arc<Mutex<HashMap<String, (u16, Vec<u8>, Duration)>>>;
+
+struct AssetServer {
+    address: SocketAddr,
+    routes: AssetRoutes,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AssetServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let routes = AssetRoutes::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_routes = routes.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_asset_request(stream, &thread_routes),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            routes,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn base_url(&self) -> Url {
+        Url::parse(&format!("http://{}/ui/", self.address)).unwrap()
+    }
+
+    fn publish(&self, manifest: &AssetManifest, files: &[(&str, &[u8])]) {
+        let mut routes = self.routes.lock().unwrap();
+        routes.clear();
+        routes.insert(
+            "/ui/manifest.json".into(),
+            (200, serde_json::to_vec(manifest).unwrap(), Duration::ZERO),
+        );
+        for (path, bytes) in files {
+            routes.insert(
+                format!("/ui/{}{path}", manifest.asset_base),
+                (200, bytes.to_vec(), Duration::ZERO),
+            );
+        }
+    }
+
+    fn delay(&self, path: &str, delay: Duration) {
+        self.routes.lock().unwrap().get_mut(path).unwrap().2 = delay;
+    }
+
+    fn publish_manifest_only(&self, manifest: &AssetManifest) {
+        self.publish(manifest, &[]);
+    }
+}
+
+impl Drop for AssetServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_asset_request(mut stream: TcpStream, routes: &AssetRoutes) {
+    let mut request_line = String::new();
+    {
+        let mut reader = BufReader::new(&stream);
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        let mut header = String::new();
+        loop {
+            header.clear();
+            if reader.read_line(&mut header).is_err() || header == "\r\n" || header.is_empty() {
+                break;
+            }
+        }
+    }
+    let path = request_line.split_ascii_whitespace().nth(1).unwrap_or("/");
+    let (status, body, delay) =
+        routes
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or((404, Vec::new(), Duration::ZERO));
+    thread::sleep(delay);
+    let reason = if status == 200 { "OK" } else { "Not Found" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+fn asset_manifest(version: &str, files: &[(&str, &[u8])]) -> AssetManifest {
+    AssetManifest {
+        version: version.into(),
+        bridge_version: ASSET_BRIDGE_VERSION,
+        asset_base: String::new(),
+        files: files
+            .iter()
+            .map(|(path, bytes)| AssetManifestFile {
+                path: (*path).into(),
+                sha256: revision(bytes),
+                size: bytes.len() as u64,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn remote_asset_cache_updates_pins_generations_and_survives_offline_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    let v1_files: &[(&str, &[u8])] = &[
+        ("assets/app.js", b"console.log('one')"),
+        ("index.html", b"version one"),
+    ];
+    let mut v1 = asset_manifest("1111111", v1_files);
+    v1.asset_base = "1111111/".into();
+    server.publish(&v1, v1_files);
+
+    let pinned_v1 = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_eq!(
+        fs::read(pinned_v1.join("index.html")).unwrap(),
+        b"version one"
+    );
+    assert_eq!(
+        fs::read_to_string(cache.join("current")).unwrap(),
+        "1111111"
+    );
+
+    let v2_files: &[(&str, &[u8])] = &[
+        ("assets/app.js", b"console.log('two')"),
+        ("index.html", b"version two"),
+    ];
+    let mut v2 = asset_manifest("2222222", v2_files);
+    v2.asset_base = "2222222/".into();
+    server.publish(&v2, v2_files);
+    let pinned_v2 = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_ne!(pinned_v1, pinned_v2);
+    assert_eq!(
+        fs::read(pinned_v2.join("index.html")).unwrap(),
+        b"version two"
+    );
+    assert_eq!(
+        fs::read(pinned_v1.join("index.html")).unwrap(),
+        b"version one"
+    );
+    assert_eq!(
+        fs::read_to_string(cache.join("current")).unwrap(),
+        "2222222"
+    );
+
+    drop(server);
+    let offline = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_eq!(offline, pinned_v2);
+    assert_eq!(
+        fs::read(offline.join("index.html")).unwrap(),
+        b"version two"
+    );
+}
+
+#[test]
+fn remote_asset_cache_falls_back_on_partial_hash_and_incompatible_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    let stable_files: &[(&str, &[u8])] = &[("index.html", b"stable")];
+    let stable = asset_manifest("aaaaaaa", stable_files);
+    server.publish(&stable, stable_files);
+    let stable_path = resolve_remote_assets(&remote, &cache).unwrap();
+
+    let intended_files: &[(&str, &[u8])] = &[("index.html", b"complete update")];
+    let partial = asset_manifest("bbbbbbb", intended_files);
+    server.publish(&partial, &[("index.html", b"partial")]);
+    assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
+    assert!(!cache.join("generations/bbbbbbb").exists());
+
+    let hash_mismatch = asset_manifest("ccccccc", intended_files);
+    server.publish(&hash_mismatch, &[("index.html", b"same sized bad!")]);
+    assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
+    assert!(!cache.join("generations/ccccccc").exists());
+
+    let mut incompatible = asset_manifest("ddddddd", intended_files);
+    incompatible.bridge_version = 2;
+    server.publish_manifest_only(&incompatible);
+    assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
+    assert_eq!(
+        fs::read_to_string(cache.join("current")).unwrap(),
+        "aaaaaaa"
+    );
+    assert!(fs::read_dir(&cache).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".staging-")));
+}
+
+#[test]
+fn remote_asset_cache_rejects_invalid_first_generation_and_unsafe_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    let mut incompatible = asset_manifest("eeeeeee", &[("index.html", b"no")]);
+    incompatible.bridge_version = 9;
+    server.publish_manifest_only(&incompatible);
+    assert!(resolve_remote_assets(&remote, &cache).is_err());
+
+    for path in [
+        "../index.html",
+        "foo//index.html",
+        "foo/./index.html",
+        "https:evil.example",
+        "app.js?x",
+        "app.js#x",
+        "percent%2ejs",
+    ] {
+        assert!(validate_asset_path(path).is_err(), "path {path}");
+    }
+    assert!(scoped_remote_url(&remote, "../escape.js").is_err());
+}
+
+#[test]
+fn remote_asset_cache_repairs_corrupt_version_without_mutating_pinned_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    let files: &[(&str, &[u8])] = &[("index.html", b"verified")];
+    let manifest = asset_manifest("abcdef0", files);
+    server.publish(&manifest, files);
+    let original = resolve_remote_assets(&remote, &cache).unwrap();
+    fs::write(original.join("index.html"), b"corrupt!").unwrap();
+
+    let repaired = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_ne!(repaired, original);
+    assert_eq!(fs::read(original.join("index.html")).unwrap(), b"corrupt!");
+    assert_eq!(fs::read(repaired.join("index.html")).unwrap(), b"verified");
+    let cache_id = fs::read_to_string(cache.join("current")).unwrap();
+    assert!(cache_id.starts_with("abcdef0-"));
+    assert_eq!(cache_id.len(), "abcdef0-".len() + 32);
+
+    // The original remains corrupt, but a subsequent online start reuses the
+    // active repair without downloading the assets again.
+    server.publish_manifest_only(&manifest);
+    assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), repaired);
+
+    // Reusing a version for different valid contents violates the immutable
+    // manifest contract. Keep serving the active verified generation.
+    let changed_files: &[(&str, &[u8])] = &[("index.html", b"different")];
+    let changed_manifest = asset_manifest("abcdef0", changed_files);
+    server.publish(&changed_manifest, changed_files);
+    assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), repaired);
+    assert_eq!(fs::read(repaired.join("index.html")).unwrap(), b"verified");
+    assert_eq!(fs::read_dir(cache.join("generations")).unwrap().count(), 2);
+}
+
+#[test]
+fn remote_asset_cache_uses_fallback_when_overall_update_budget_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    let stable_files: &[(&str, &[u8])] = &[("index.html", b"stable")];
+    let stable = asset_manifest("1111111", stable_files);
+    server.publish(&stable, stable_files);
+    let stable_path = resolve_remote_assets(&remote, &cache).unwrap();
+
+    let update_files: &[(&str, &[u8])] = &[("index.html", b"update")];
+    let update = asset_manifest("2222222", update_files);
+    server.publish(&update, update_files);
+    server.delay("/ui/manifest.json", Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let selected =
+        resolve_remote_assets_with_budget(&remote, &cache, Duration::from_millis(25)).unwrap();
+    assert_eq!(selected, stable_path);
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert_eq!(
+        fs::read_to_string(cache.join("current")).unwrap(),
+        "1111111"
+    );
+}
 
 struct Fixture {
     _temp: TempDir,
