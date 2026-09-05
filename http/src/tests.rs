@@ -34,7 +34,10 @@ impl AssetServer {
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((stream, _)) => serve_asset_request(stream, &thread_routes),
+                    Ok((stream, _)) => {
+                        let request_routes = thread_routes.clone();
+                        thread::spawn(move || serve_asset_request(stream, &request_routes));
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -139,6 +142,27 @@ fn asset_manifest(version: &str, files: &[(&str, &[u8])]) -> AssetManifest {
     }
 }
 
+fn install_legacy_generation(
+    cache: &Path,
+    manifest: &AssetManifest,
+    files: &[(&str, &[u8])],
+) -> PathBuf {
+    let generation = cache.join("generations").join(&manifest.version);
+    fs::create_dir_all(&generation).unwrap();
+    for (path, bytes) in files {
+        let destination = generation.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+    fs::write(
+        generation.join("manifest.json"),
+        serde_json::to_vec(manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache.join("current"), &manifest.version).unwrap();
+    generation
+}
+
 #[test]
 fn remote_asset_cache_updates_pins_generations_and_survives_offline_start() {
     let temp = tempfile::tempdir().unwrap();
@@ -159,7 +183,7 @@ fn remote_asset_cache_updates_pins_generations_and_survives_offline_start() {
         b"version one"
     );
     assert_eq!(
-        fs::read_to_string(cache.join("current")).unwrap(),
+        fs::read_to_string(cache.join("managed-v1/current")).unwrap(),
         "1111111"
     );
 
@@ -181,7 +205,7 @@ fn remote_asset_cache_updates_pins_generations_and_survives_offline_start() {
         b"version one"
     );
     assert_eq!(
-        fs::read_to_string(cache.join("current")).unwrap(),
+        fs::read_to_string(cache.join("managed-v1/current")).unwrap(),
         "2222222"
     );
 
@@ -209,26 +233,28 @@ fn remote_asset_cache_falls_back_on_partial_hash_and_incompatible_updates() {
     let partial = asset_manifest("bbbbbbb", intended_files);
     server.publish(&partial, &[("index.html", b"partial")]);
     assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
-    assert!(!cache.join("generations/bbbbbbb").exists());
+    assert!(!cache.join("managed-v1/generations/bbbbbbb").exists());
 
     let hash_mismatch = asset_manifest("ccccccc", intended_files);
     server.publish(&hash_mismatch, &[("index.html", b"same sized bad!")]);
     assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
-    assert!(!cache.join("generations/ccccccc").exists());
+    assert!(!cache.join("managed-v1/generations/ccccccc").exists());
 
     let mut incompatible = asset_manifest("ddddddd", intended_files);
     incompatible.bridge_version = 2;
     server.publish_manifest_only(&incompatible);
     assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), stable_path);
     assert_eq!(
-        fs::read_to_string(cache.join("current")).unwrap(),
+        fs::read_to_string(cache.join("managed-v1/current")).unwrap(),
         "aaaaaaa"
     );
-    assert!(fs::read_dir(&cache).unwrap().all(|entry| !entry
+    assert!(fs::read_dir(cache.join("managed-v1"))
         .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .starts_with(".staging-")));
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".staging-")));
 }
 
 #[test]
@@ -272,7 +298,7 @@ fn remote_asset_cache_repairs_corrupt_version_without_mutating_pinned_directory(
     assert_ne!(repaired, original);
     assert_eq!(fs::read(original.join("index.html")).unwrap(), b"corrupt!");
     assert_eq!(fs::read(repaired.join("index.html")).unwrap(), b"verified");
-    let cache_id = fs::read_to_string(cache.join("current")).unwrap();
+    let cache_id = fs::read_to_string(cache.join("managed-v1/current")).unwrap();
     assert!(cache_id.starts_with("abcdef0-"));
     assert_eq!(cache_id.len(), "abcdef0-".len() + 32);
 
@@ -288,7 +314,12 @@ fn remote_asset_cache_repairs_corrupt_version_without_mutating_pinned_directory(
     server.publish(&changed_manifest, changed_files);
     assert_eq!(resolve_remote_assets(&remote, &cache).unwrap(), repaired);
     assert_eq!(fs::read(repaired.join("index.html")).unwrap(), b"verified");
-    assert_eq!(fs::read_dir(cache.join("generations")).unwrap().count(), 2);
+    assert_eq!(
+        fs::read_dir(cache.join("managed-v1/generations"))
+            .unwrap()
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -312,9 +343,122 @@ fn remote_asset_cache_uses_fallback_when_overall_update_budget_expires() {
     assert_eq!(selected, stable_path);
     assert!(started.elapsed() < Duration::from_millis(200));
     assert_eq!(
-        fs::read_to_string(cache.join("current")).unwrap(),
+        fs::read_to_string(cache.join("managed-v1/current")).unwrap(),
         "1111111"
     );
+}
+
+#[test]
+fn remote_asset_cache_recovers_from_corrupt_active_generation_while_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+
+    let v1_files: &[(&str, &[u8])] = &[("index.html", b"older valid")];
+    server.publish(&asset_manifest("1111111", v1_files), v1_files);
+    let v1 = resolve_remote_assets(&remote, &cache).unwrap();
+    let v1_path = v1.path.clone();
+
+    let v2_files: &[(&str, &[u8])] = &[("index.html", b"new current")];
+    server.publish(&asset_manifest("2222222", v2_files), v2_files);
+    let v2 = resolve_remote_assets(&remote, &cache).unwrap();
+    let v2_path = v2.path.clone();
+    drop(v1);
+    fs::write(v2_path.join("index.html"), b"corrupted!!").unwrap();
+    drop(v2);
+    drop(server);
+
+    let recovered = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_eq!(recovered.path.as_path(), v1_path.as_path());
+    assert_eq!(
+        fs::read(recovered.join("index.html")).unwrap(),
+        b"older valid"
+    );
+    assert_eq!(
+        fs::read_to_string(cache.join("managed-v1/current")).unwrap(),
+        "1111111"
+    );
+    assert!(!v2_path.exists());
+}
+
+#[test]
+fn remote_asset_cache_leases_bound_gc_without_deleting_pinned_generations() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let server = AssetServer::start();
+    let remote = server.base_url();
+
+    let publish = |version: &str, body: &'static [u8]| {
+        let files: &[(&str, &[u8])] = &[("index.html", body)];
+        let manifest = asset_manifest(version, files);
+        server.publish(&manifest, files);
+        resolve_remote_assets(&remote, &cache).unwrap()
+    };
+    let v1 = publish("1111111", b"one");
+    let v1_path = v1.path.clone();
+    let v2 = publish("2222222", b"two");
+    let v2_path = v2.path.clone();
+    let v3 = publish("3333333", b"three");
+    let v3_path = v3.path.clone();
+
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(v1_path.join(ASSET_LEASE_FILE))
+        .unwrap();
+    assert!(!try_lock_file(&lease_probe, libc::LOCK_EX, "test lease").unwrap());
+    assert!(v1_path.exists() && v2_path.exists() && v3_path.exists());
+    drop(lease_probe);
+
+    drop(v1);
+    assert!(!v1_path.exists());
+    drop(v2);
+    assert!(v2_path.exists());
+
+    let v4 = publish("4444444", b"four");
+    assert!(!v2_path.exists());
+    assert!(v3_path.exists() && v4.path.exists());
+    assert_eq!(
+        fs::read_dir(cache.join("managed-v1/generations"))
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn remote_asset_cache_reads_but_never_prunes_legacy_namespace_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    let files: &[(&str, &[u8])] = &[("index.html", b"legacy offline")];
+    let legacy = install_legacy_generation(&cache, &asset_manifest("aaaaaaa", files), files);
+    let server = AssetServer::start();
+    let remote = server.base_url();
+    drop(server);
+
+    let selected = resolve_remote_assets(&remote, &cache).unwrap();
+    assert_eq!(selected.path.as_path(), legacy.as_path());
+    assert_eq!(
+        fs::read(selected.join("index.html")).unwrap(),
+        b"legacy offline"
+    );
+    assert!(legacy.exists());
+    assert!(!cache.join("managed-v1/current").exists());
+
+    let online = AssetServer::start();
+    let update_files: &[(&str, &[u8])] = &[("index.html", b"managed update")];
+    online.publish(&asset_manifest("bbbbbbb", update_files), update_files);
+    let managed = resolve_remote_assets(&online.base_url(), &cache).unwrap();
+    assert!(managed
+        .path
+        .starts_with(cache.join("managed-v1/generations")));
+    assert_eq!(
+        fs::read_to_string(cache.join("current")).unwrap(),
+        "aaaaaaa"
+    );
+    assert!(legacy.exists());
 }
 
 struct Fixture {
