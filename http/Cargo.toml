@@ -1,0 +1,28 @@
+[package]
+name = "sidequery-ui-http"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "sidequery_http"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+axum = { version = "0.7", features = ["json", "query"] }
+bytes = "1"
+http-body-util = "0.1"
+libc = "0.2"
+mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

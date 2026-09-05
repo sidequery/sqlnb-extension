@@ -1,0 +1,10 @@
+.artifacts/
+.deps/
+.agents/
+build/
+node_modules/
+test-results/
+playwright-report/
+target
+*.log
+.DS_Store
