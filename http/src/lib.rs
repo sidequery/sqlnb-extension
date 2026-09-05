@@ -11,6 +11,7 @@ use axum::{
 };
 #[cfg(test)]
 use bytes::Bytes;
+mod cache_location;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,7 +21,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     os::unix::ffi::OsStringExt,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     ptr,
     sync::{mpsc, Arc, Mutex},
@@ -42,6 +43,9 @@ const MAX_ASSET_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ASSET_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 const ASSET_BRIDGE_VERSION: u32 = 1;
 const ASSET_UPDATE_BUDGET: Duration = Duration::from_secs(60);
+const ASSET_MANAGED_CACHE: &str = "managed-v1";
+const ASSET_CACHE_LOCK: &str = ".cache-lock-v1";
+const ASSET_LEASE_FILE: &str = ".lease-v1";
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +69,77 @@ struct AppState {
     duckdb_version: String,
     quack_url: Url,
     client: reqwest::Client,
-    assets: PathBuf,
+    assets: Arc<ResolvedAssets>,
     notebooks: Arc<NotebookStore>,
+}
+
+#[derive(Debug)]
+struct ResolvedAssets {
+    path: PathBuf,
+    _lease: Option<GenerationLease>,
+}
+
+impl std::ops::Deref for ResolvedAssets {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl PartialEq for ResolvedAssets {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for ResolvedAssets {}
+
+#[derive(Debug)]
+struct GenerationLease {
+    file: Option<File>,
+    cache_scope: PathBuf,
+}
+
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = unlock_file(&file);
+            drop(file);
+        }
+        // A resolver may be unwinding while it still owns the transaction
+        // lock. Cleanup is opportunistic here and guaranteed to run again on
+        // the next startup, so never wait and risk a self-deadlock.
+        if let Ok(Some(_transaction)) = CacheTransaction::try_lock(&self.cache_scope) {
+            let _ = prune_generations_locked(&self.cache_scope);
+        }
+    }
+}
+
+struct CacheTransaction {
+    file: File,
+}
+
+impl CacheTransaction {
+    fn lock(cache_scope: &Path) -> Result<Self, String> {
+        let file = open_lock_file(&cache_scope.join(ASSET_CACHE_LOCK))?;
+        lock_file(&file, libc::LOCK_EX, "UI cache transaction")?;
+        Ok(Self { file })
+    }
+
+    fn try_lock(cache_scope: &Path) -> Result<Option<Self>, String> {
+        let file = open_lock_file(&cache_scope.join(ASSET_CACHE_LOCK))?;
+        match try_lock_file(&file, libc::LOCK_EX, "UI cache transaction")? {
+            true => Ok(Some(Self { file })),
+            false => Ok(None),
+        }
+    }
+}
+
+impl Drop for CacheTransaction {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.file);
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -233,11 +306,15 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         if !path.is_absolute() || !path.is_dir() {
             return Err("local asset directory must be an existing absolute directory".into());
         }
-        path.canonicalize()
-            .map_err(|error| format!("failed to resolve local asset directory: {error}"))?
+        ResolvedAssets {
+            path: path
+                .canonicalize()
+                .map_err(|error| format!("failed to resolve local asset directory: {error}"))?,
+            _lease: None,
+        }
     } else if !config.remote_asset_url.is_empty() {
         let remote = parse_remote_asset_url(&config.remote_asset_url)?;
-        let cache = default_asset_cache_scope(&remote)?;
+        let cache = cache_location::asset_cache_scope(&remote)?;
         resolve_remote_assets(&remote, &cache)?
     } else {
         return Err("remote asset URL or local asset directory is required".into());
@@ -257,7 +334,7 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         duckdb_version: config.duckdb_version,
         quack_url,
         client,
-        assets,
+        assets: Arc::new(assets),
         notebooks: Arc::new(notebooks),
     })
 }
@@ -314,26 +391,7 @@ fn parse_remote_asset_url(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn default_asset_cache_scope(remote: &Url) -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is unavailable; cannot locate UI cache")?;
-    #[cfg(target_os = "macos")]
-    let root = PathBuf::from(home)
-        .join("Library")
-        .join("Caches")
-        .join("sidequery")
-        .join("sqlnb-extension")
-        .join("ui");
-    #[cfg(target_os = "linux")]
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(home).join(".cache"))
-        .join("sidequery")
-        .join("sqlnb-extension")
-        .join("ui");
-    Ok(root.join(revision(remote.as_str().as_bytes())))
-}
-
-fn resolve_remote_assets(remote: &Url, cache_scope: &Path) -> Result<PathBuf, String> {
+fn resolve_remote_assets(remote: &Url, cache_scope: &Path) -> Result<ResolvedAssets, String> {
     resolve_remote_assets_with_budget(remote, cache_scope, ASSET_UPDATE_BUDGET)
 }
 
@@ -341,19 +399,90 @@ fn resolve_remote_assets_with_budget(
     remote: &Url,
     cache_scope: &Path,
     budget: Duration,
-) -> Result<PathBuf, String> {
+) -> Result<ResolvedAssets, String> {
     fs::create_dir_all(cache_scope)
         .map_err(|error| format!("failed to create UI cache: {error}"))?;
-    let fallback = load_active_generation(cache_scope);
-    match fetch_and_activate_generation(remote, cache_scope, budget) {
-        Ok(generation) => Ok(generation),
+    let managed_scope = cache_scope.join(ASSET_MANAGED_CACHE);
+    fs::create_dir_all(&managed_scope)
+        .map_err(|error| format!("failed to create managed UI cache: {error}"))?;
+    let _transaction = CacheTransaction::lock(&managed_scope)?;
+    let fallback = select_valid_fallback(&managed_scope)
+        // The original namespace is read-only compatibility storage. An old
+        // binary cannot discover managed-v1 generations and therefore cannot
+        // become an untracked reader of a directory eligible for GC.
+        .or_else(|_| select_valid_fallback(cache_scope));
+    let generation = match fetch_and_activate_generation(remote, &managed_scope, budget) {
+        Ok(generation) => generation,
         Err(update_error) => match fallback {
-            Ok(generation) => Ok(generation),
-            Err(cache_error) => Err(format!(
+            Ok(generation) => {
+                if generation.starts_with(managed_scope.join("generations")) {
+                    let cache_id = generation_cache_id(&generation)?;
+                    activate_generation(&managed_scope, cache_id)?;
+                }
+                generation
+            }
+            Err(cache_error) => return Err(format!(
                 "failed to update Sidequery UI assets ({update_error}); no valid cached UI is available ({cache_error})"
             )),
         },
+    };
+    let lease = if generation.starts_with(managed_scope.join("generations")) {
+        acquire_generation_lease(&managed_scope, &generation)?
+    } else {
+        None
+    };
+    // Cache cleanup must never make an already verified, leased UI
+    // unavailable. A later startup or lease release retries pruning.
+    let _ = prune_generations_locked(&managed_scope);
+    Ok(ResolvedAssets {
+        path: generation,
+        _lease: lease,
+    })
+}
+
+fn open_lock_file(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("failed to open UI cache lock {}: {error}", path.display()))
+}
+
+fn lock_file(file: &File, operation: libc::c_int, label: &str) -> Result<(), String> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("failed to lock {label}: {error}"));
+        }
     }
+}
+
+fn try_lock_file(file: &File, operation: libc::c_int, label: &str) -> Result<bool, String> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+        {
+            return Ok(false);
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("failed to lock {label}: {error}"));
+        }
+    }
+}
+
+fn unlock_file(file: &File) -> Result<(), String> {
+    lock_file(file, libc::LOCK_UN, "UI cache file")
 }
 
 fn asset_client() -> Result<reqwest::blocking::Client, String> {
@@ -430,6 +559,10 @@ fn fetch_and_activate_generation(
     fs::create_dir(&staging)
         .map_err(|error| format!("failed to create UI staging directory: {error}"))?;
     let download = (|| {
+        // Only generations created with this marker participate in GC. Older
+        // extension versions did not hold leases, so their directories must
+        // remain untouched while such a process may still be serving them.
+        write_new_file(&staging.join(ASSET_LEASE_FILE), b"")?;
         for file in &manifest.files {
             let relative = validate_asset_path(&file.path)?;
             let destination = staging.join(&relative);
@@ -670,6 +803,142 @@ fn load_active_generation(cache_scope: &Path) -> Result<PathBuf, String> {
     let generation = cache_scope.join("generations").join(cache_id);
     validate_cached_generation(&generation, None)?;
     Ok(generation)
+}
+
+fn generation_cache_id(generation: &Path) -> Result<&str, String> {
+    generation
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "cached UI generation has an invalid directory name".into())
+}
+
+fn select_valid_fallback(cache_scope: &Path) -> Result<PathBuf, String> {
+    if let Ok(active) = load_active_generation(cache_scope) {
+        return Ok(active);
+    }
+    let generations = cache_scope.join("generations");
+    let entries = fs::read_dir(&generations)
+        .map_err(|error| format!("failed to list cached UI generations: {error}"))?;
+    let mut valid = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        if validate_cached_generation(&path, None).is_ok() {
+            valid.push((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                entry.file_name(),
+                path,
+            ));
+        }
+    }
+    valid.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    valid
+        .into_iter()
+        .next()
+        .map(|(_, _, path)| path)
+        .ok_or_else(|| "no valid cached UI generation was found".into())
+}
+
+fn acquire_generation_lease(
+    cache_scope: &Path,
+    generation: &Path,
+) -> Result<Option<GenerationLease>, String> {
+    let lease_path = generation.join(ASSET_LEASE_FILE);
+    match fs::symlink_metadata(&lease_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to inspect UI generation lease: {error}")),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("UI generation lease marker is not a regular file".into())
+        }
+        Ok(_) => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&lease_path)
+                .map_err(|error| format!("failed to open UI generation lease: {error}"))?;
+            lock_file(&file, libc::LOCK_SH, "UI generation lease")?;
+            Ok(Some(GenerationLease {
+                file: Some(file),
+                cache_scope: cache_scope.to_path_buf(),
+            }))
+        }
+    }
+}
+
+fn prune_generations_locked(cache_scope: &Path) -> Result<(), String> {
+    let generations = cache_scope.join("generations");
+    let entries = match fs::read_dir(&generations) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("failed to list cached UI generations: {error}")),
+    };
+    let current = fs::read_to_string(cache_scope.join("current"))
+        .ok()
+        .filter(|value| validate_cache_id(value).is_ok());
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(cache_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let valid = validate_cached_generation(&path, None).is_ok();
+        candidates.push((
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            cache_id,
+            path,
+            valid,
+        ));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let fallback = candidates
+        .iter()
+        .find(|(_, cache_id, _, valid)| *valid && current.as_deref() != Some(cache_id.as_str()))
+        .map(|(_, cache_id, _, _)| cache_id.clone());
+
+    for (_, cache_id, path, _) in candidates {
+        if current.as_deref() == Some(cache_id.as_str())
+            || fallback.as_deref() == Some(cache_id.as_str())
+        {
+            continue;
+        }
+        let lease_path = path.join(ASSET_LEASE_FILE);
+        let Ok(metadata) = fs::symlink_metadata(&lease_path) else {
+            // Legacy generations have no lease marker. Preserve them because
+            // an older process may still have the directory pinned.
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lease_path)
+        else {
+            continue;
+        };
+        if try_lock_file(&file, libc::LOCK_EX, "UI generation lease")? {
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!("failed to remove obsolete UI generation {cache_id}: {error}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_cached_generation(
@@ -1728,11 +1997,11 @@ async fn static_asset(
         ));
     }
     let path = if path.is_empty() { "index.html" } else { path };
-    let file = state.assets.join(path);
+    let file = state.assets.path.join(path);
     let canonical = file
         .canonicalize()
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "not_found", "asset does not exist"))?;
-    if !canonical.starts_with(&state.assets) || !canonical.is_file() {
+    if !canonical.starts_with(&state.assets.path) || !canonical.is_file() {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
