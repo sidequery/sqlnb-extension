@@ -43,3 +43,36 @@ On Linux, an absolute `XDG_CACHE_HOME` works even when `HOME` is unset. Empty or
 New releases live in a separate `managed-v1` directory. Cache cleanup retains the current release, one verified fallback, and releases leased by running extension instances. Obsolete managed releases are removed after their leases are released. Older cache directories are kept as read-only offline fallbacks, since older extension processes do not support leases and may still be using them.
 
 For development, the second argument to `sidequery_ui_start` accepts an absolute local asset directory and takes precedence over the remote URL. No UI source checkout or frontend build is required by the installed extension.
+
+## Private repository alpha build
+
+The stable build above remains pinned to DuckDB 1.5.4. For the private repository,
+use the official `v2.0.0-alpha41489` CLI (source `10de957379`):
+
+```sh
+scripts/build-alpha.sh --duckdb /absolute/path/to/alpha41489/duckdb
+```
+
+This macOS build compiles only Quack and `sidequery_ui` against that exact source,
+applies its upstream Quack compatibility patches, and runs the Rust and native
+smoke suites, including the live deployed UI check. It fetches and verifies pinned
+OpenSSL 3.6.3, then builds its static libraries for the same macOS 11.0 deployment
+target as the extensions and Rust server. Curl, Perl, and Make are required in
+addition to the normal build tools. Build concurrency defaults to two; set
+`CMAKE_BUILD_PARALLEL_LEVEL` to change it. Outputs are retained
+in `.artifacts/v2.0.0-alpha41489/<platform>/`. The matching official `httpfs` is
+installed from `core`; it is not republished by Sidequery. The output includes
+source/dependency provenance and SHA-256 checksums.
+
+After signing and preparing the repository with the Sidequery monorepo's
+`tools/extension-repository` tool, validate the signed distribution:
+
+```sh
+bun scripts/runtime-smoke.mjs --duckdb /absolute/path/to/alpha41489/duckdb \
+  --repository https://extensions.sidequery.dev
+```
+
+A local repository directory is also accepted. Each client uses fresh extension
+and trust directories, allows only signed extensions, and installs Quack and
+`sidequery_ui` from Sidequery. The suite checks queries, notebook files, caller
+isolation, authentication, server cleanup, and remote UI generation updates.

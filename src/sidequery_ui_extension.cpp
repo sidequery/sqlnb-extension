@@ -1,3 +1,9 @@
+// Include the platform declarations before DuckDB defines its restrict macro.
+#ifndef _WIN32
+#include <spawn.h>
+#include <sys/wait.h>
+#endif
+
 #include "sidequery_ui_extension.hpp"
 #include "sidequery_http.h"
 
@@ -18,8 +24,6 @@
 #include <thread>
 
 #ifndef _WIN32
-#include <spawn.h>
-#include <sys/wait.h>
 extern char **environ;
 #endif
 #ifdef _WIN32
@@ -342,18 +346,22 @@ static void LoadInternal(ExtensionLoader &loader) {
                              LogicalType::BOOLEAN},
                             LogicalType::VARCHAR, StartFunction);
   start_four.SetVolatile();
+  start_four.SetFallible();
   starts.AddFunction(start_four);
   ScalarFunction start_five({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
                              LogicalType::BOOLEAN, LogicalType::VARCHAR},
                             LogicalType::VARCHAR, StartFunction);
   start_five.SetVolatile();
+  start_five.SetFallible();
   starts.AddFunction(start_five);
   loader.RegisterFunction(starts);
   ScalarFunction status("sidequery_ui_status", {}, LogicalType::VARCHAR, StatusFunction);
   status.SetVolatile();
+  status.SetFallible();
   loader.RegisterFunction(status);
   ScalarFunction stop("sidequery_ui_stop", {}, LogicalType::BOOLEAN, StopFunction);
   stop.SetVolatile();
+  stop.SetFallible();
   loader.RegisterFunction(stop);
 }
 

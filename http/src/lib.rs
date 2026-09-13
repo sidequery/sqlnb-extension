@@ -442,7 +442,9 @@ fn resolve_remote_assets_with_budget(
     // unavailable. A later startup or lease release retries pruning.
     let _ = prune_generations_locked(&managed_scope);
     Ok(ResolvedAssets {
-        path: generation,
+        path: generation
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve cached UI asset directory: {error}"))?,
         _lease: lease,
     })
 }
