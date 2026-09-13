@@ -190,6 +190,17 @@ const startRows = await runSQL(
 const start = JSON.parse(firstValue(startRows));
 assert.equal(start.engine, 'native-duckdb');
 assert.equal(start.protocol, 'quack');
+assert.equal(
+  firstValue(await runSQL("select loaded from duckdb_extensions() where extension_name = 'icu'")),
+  true,
+);
+// Match the UTC timestamp expression used by source-column date profiles.
+// Disable query-triggered autoloading to prove startup supplied the dependency.
+assert.equal(
+  firstValue(await runSQL("set autoload_known_extensions = false; select cast(to_timestamp(86400) at time zone 'UTC' as varchar)")),
+  '1970-01-02 00:00:00',
+);
+await runSQL('set autoload_known_extensions = true; select true');
 const launch = new URL(start.launchUrl);
 const token = launch.hash.match(/^#sidequery_token=([0-9a-f]{64})$/)?.[1];
 assert(token, `missing launch capability: ${start.launchUrl}`);
