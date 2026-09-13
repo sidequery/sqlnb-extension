@@ -43,6 +43,7 @@ const MAX_ASSET_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ASSET_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 const ASSET_BRIDGE_VERSION: u32 = 1;
 const ASSET_UPDATE_BUDGET: Duration = Duration::from_secs(60);
+const ASSET_DOWNLOAD_WORKERS: usize = 8;
 const ASSET_MANAGED_CACHE: &str = "managed-v1";
 const ASSET_CACHE_LOCK: &str = ".cache-lock-v1";
 const ASSET_LEASE_FILE: &str = ".lease-v1";
@@ -163,6 +164,12 @@ struct NotebookStore {
     root: PathBuf,
     root_fd: OwnedFd,
     writes: Mutex<()>,
+    recent_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RecentNotebook {
+    path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -563,39 +570,63 @@ fn fetch_and_activate_generation(
         // extension versions did not hold leases, so their directories must
         // remain untouched while such a process may still be serving them.
         write_new_file(&staging.join(ASSET_LEASE_FILE), b"")?;
-        for file in &manifest.files {
-            let relative = validate_asset_path(&file.path)?;
-            let destination = staging.join(&relative);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("failed to create UI asset directory: {error}"))?;
+        let next_file = std::sync::atomic::AtomicUsize::new(0);
+        let download_files = || -> Result<(), String> {
+            while let Some(file) = manifest
+                .files
+                .get(next_file.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            {
+                let relative = validate_asset_path(&file.path)?;
+                let destination = staging.join(&relative);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| format!("failed to create UI asset directory: {error}"))?;
+                }
+                let remote_path = format!("{}{}", manifest.asset_base, file.path);
+                let url = scoped_remote_url(remote, &remote_path)?;
+                let bytes = fetch_limited(
+                    &client,
+                    url,
+                    file.size,
+                    &format!("UI asset {}", file.path),
+                    deadline,
+                )?;
+                if bytes.len() as u64 != file.size {
+                    return Err(format!(
+                        "UI asset {} has size {}, expected {}",
+                        file.path,
+                        bytes.len(),
+                        file.size
+                    ));
+                }
+                let actual_hash = revision(&bytes);
+                if actual_hash != file.sha256 {
+                    return Err(format!(
+                        "UI asset {} failed SHA-256 verification",
+                        file.path
+                    ));
+                }
+                write_new_file(&destination, &bytes)?;
             }
-            let remote_path = format!("{}{}", manifest.asset_base, file.path);
-            let url = scoped_remote_url(remote, &remote_path)?;
-            let bytes = fetch_limited(
-                &client,
-                url,
-                file.size,
-                &format!("UI asset {}", file.path),
-                deadline,
-            )?;
-            if bytes.len() as u64 != file.size {
-                return Err(format!(
-                    "UI asset {} has size {}, expected {}",
-                    file.path,
-                    bytes.len(),
-                    file.size
-                ));
+            Ok(())
+        };
+        thread::scope(|scope| -> Result<(), String> {
+            let workers: Vec<_> = (0..ASSET_DOWNLOAD_WORKERS.min(manifest.files.len()))
+                .map(|_| scope.spawn(download_files))
+                .collect();
+            // Join every writer before the caller can remove a failed staging
+            // directory. All workers share the original update deadline.
+            let mut result = Ok(());
+            for worker in workers {
+                if let Err(error) = worker
+                    .join()
+                    .unwrap_or_else(|_| Err("UI asset download worker panicked".into()))
+                {
+                    result = Err(error);
+                }
             }
-            let actual_hash = revision(&bytes);
-            if actual_hash != file.sha256 {
-                return Err(format!(
-                    "UI asset {} failed SHA-256 verification",
-                    file.path
-                ));
-            }
-            write_new_file(&destination, &bytes)?;
-        }
+            result
+        })?;
         let stored_manifest = serde_json::to_vec(&manifest)
             .map_err(|error| format!("failed to serialize UI manifest: {error}"))?;
         write_new_file(&staging.join("manifest.json"), &stored_manifest)?;
@@ -634,10 +665,25 @@ fn fetch_limited(
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| "Sidequery UI asset update exceeded its overall budget".to_string())?;
     let response = client
-        .get(url)
+        .get(url.clone())
         .timeout(remaining.min(Duration::from_secs(30)))
         .send()
         .map_err(|error| format!("failed to fetch {label}: {error:?}"))?;
+    // Static hosts canonicalize index.html to its containing directory. Accept
+    // only that exact same-origin redirect, then verify the original manifest's
+    // size and digest as usual. Never follow arbitrary asset redirects.
+    if response.status().is_redirection() && url.path().ends_with("/index.html") {
+        let mut canonical = url.clone();
+        canonical.set_path(url.path().strip_suffix("index.html").unwrap());
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| url.join(value).ok());
+        if location.as_ref() == Some(&canonical) {
+            return fetch_limited(client, canonical, limit, label, deadline);
+        }
+    }
     if !response.status().is_success() {
         return Err(format!(
             "failed to fetch {label}: HTTP {}",
@@ -1059,6 +1105,7 @@ impl NotebookStore {
         let root_fd = open_directory(&root)
             .map_err(|error| format!("failed to open notebook root: {error}"))?;
         Ok(Self {
+            recent_path: cache_location::notebook_state_path(&root).ok(),
             root,
             root_fd,
             writes: Mutex::new(()),
@@ -1077,6 +1124,57 @@ impl NotebookStore {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         directories.sort();
         Ok(NotebookListing { files, directories })
+    }
+
+    fn recent(&self) -> Option<String> {
+        let file = File::open(self.recent_path.as_ref()?).ok()?;
+        // Preferences are optional and untrusted. Bound reads and revalidate
+        // the notebook through the same descriptor-based file boundary.
+        let recent: RecentNotebook = serde_json::from_reader(file.take(8192)).ok()?;
+        let path = validate_relative_path(recent.path.as_deref()?).ok()?;
+        self.read(&path).ok()?;
+        slash_path(&path).ok()
+    }
+
+    fn remember(&self, path: &Path) -> Result<String, ApiError> {
+        self.read(path)?;
+        let path = slash_path(path)?;
+        let destination = self.recent_path.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_io",
+                "notebook preferences unavailable",
+            )
+        })?;
+        let directory = destination.parent().ok_or_else(invalid_path)?;
+        fs::create_dir_all(directory).map_err(file_io)?;
+        let temporary = directory.join(format!(".recent-{}", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec(&RecentNotebook {
+            path: Some(path.clone()),
+        })
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_io",
+                error.to_string(),
+            )
+        })?;
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(file_io)?;
+            file.write_all(&bytes).map_err(file_io)?;
+            file.sync_all().map_err(file_io)?;
+            fs::rename(&temporary, destination).map_err(file_io)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(path)
     }
 
     fn read(&self, relative: &Path) -> Result<(String, String), ApiError> {
@@ -1806,6 +1904,38 @@ async fn list_files(
     }))
 }
 
+async fn get_recent_notebook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let notebooks = state.notebooks.clone();
+    let path = tokio::task::spawn_blocking(move || notebooks.recent())
+        .await
+        .unwrap_or(None);
+    Ok(Json(RecentNotebook { path }))
+}
+
+async fn put_recent_notebook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FileQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let path = validate_relative_path(&body.path)?;
+    let notebooks = state.notebooks.clone();
+    let path = tokio::task::spawn_blocking(move || notebooks.remember(&path))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_io",
+                "file task failed",
+            )
+        })??;
+    Ok(Json(RecentNotebook { path: Some(path) }))
+}
+
 async fn create_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2021,6 +2151,10 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/files", get(list_files))
+        .route(
+            "/api/v1/recent-notebook",
+            get(get_recent_notebook).put(put_recent_notebook),
+        )
         .route("/api/v1/file", get(get_file).put(put_file))
         .route("/api/v1/file/move", post(move_file))
         .route("/api/v1/folder", post(create_folder))
