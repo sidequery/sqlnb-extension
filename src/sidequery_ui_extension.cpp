@@ -72,7 +72,15 @@ static string RandomHex(idx_t bytes) {
   return out.str();
 }
 
-static void EnsureQuackLoaded(DatabaseInstance &database) {
+static void EnsureDependenciesLoaded(DatabaseInstance &database) {
+  // Source-column date profiles use timezone conversion. Load ICU before
+  // accepting notebook queries so their first date query never installs it.
+  if (!database.ExtensionIsLoaded("icu")) {
+    ExtensionHelper::AutoLoadExtension(database, "icu");
+  }
+  if (!database.ExtensionIsLoaded("icu")) {
+    throw MissingExtensionException("sidequery_ui requires the DuckDB icu extension for date profiles");
+  }
   // Quack uses DuckDB's writable crypto provider to generate session IDs.
   // For DuckDB 1.5.4 that provider is installed by the matching httpfs
   // extension; this is also an explicit dependency in Quack's own config.
@@ -97,7 +105,7 @@ struct QuackEndpoint {
 };
 
 static QuackEndpoint StartQuack(DatabaseInstance &database) {
-  EnsureQuackLoaded(database);
+  EnsureDependenciesLoaded(database);
   auto port = sidequery_http_unused_port();
   if (port == 0) {
     throw IOException("failed to reserve a loopback port for DuckDB Quack");

@@ -17,7 +17,7 @@ bash scripts/build-and-test.sh
 .artifacts/osx_arm64/duckdb -unsigned
 ```
 
-The native build requires Rust, Bun (for native smoke tests), CMake, Ninja, Git, and a C/C++ toolchain. It fetches pinned DuckDB, Quack, httpfs, and vcpkg sources. Use the corresponding platform artifact directory on Linux or Intel macOS.
+The native build requires Rust, Bun (for native smoke tests), CMake, Ninja, Git, and a C/C++ toolchain. It fetches pinned DuckDB, Quack, httpfs, and vcpkg sources and includes DuckDB's ICU extension for date profiles. Use the corresponding platform artifact directory on Linux or Intel macOS.
 
 Load the three matching artifacts in the DuckDB session, using absolute paths:
 
@@ -63,6 +63,14 @@ addition to the normal build tools. Build concurrency defaults to two; set
 in `.artifacts/v2.0.0-alpha41489/<platform>/`. The matching official `httpfs` is
 installed from `core`; it is not republished by Sidequery. The output includes
 source/dependency provenance and SHA-256 checksums.
+
+Starting the notebook also requires ICU for timezone conversion in date profiles.
+The server loads it before accepting queries, using DuckDB's normal extension
+autoloading policy. If ICU is not bundled with your DuckDB runtime, install the
+matching extension with `install icu from core; load icu;` before starting the
+notebook when automatic installation is disabled. Installation requires a
+writable extension directory. ICU remains an official DuckDB dependency and is
+not republished by Sidequery.
 
 After signing and preparing the repository with the Sidequery monorepo's
 `tools/extension-repository` tool, validate the signed distribution:
