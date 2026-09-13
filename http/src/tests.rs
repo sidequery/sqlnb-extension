@@ -550,7 +550,7 @@ fn remote_asset_cache_reads_but_never_prunes_legacy_namespace_offline() {
     drop(server);
 
     let selected = resolve_remote_assets(&remote, &cache).unwrap();
-    assert_eq!(selected.path.as_path(), legacy.as_path());
+    assert_eq!(selected.path, legacy.canonicalize().unwrap());
     assert_eq!(
         fs::read(selected.join("index.html")).unwrap(),
         b"legacy offline"
@@ -564,7 +564,7 @@ fn remote_asset_cache_reads_but_never_prunes_legacy_namespace_offline() {
     let managed = resolve_remote_assets(&online.base_url(), &cache).unwrap();
     assert!(managed
         .path
-        .starts_with(cache.join("managed-v1/generations")));
+        .starts_with(cache.join("managed-v1/generations").canonicalize().unwrap()));
     assert_eq!(
         fs::read_to_string(cache.join("current")).unwrap(),
         "aaaaaaa"
@@ -628,6 +628,34 @@ async fn json_body(response: Response) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn remote_assets_are_served_through_a_symlinked_cache() {
+    let mut fixture = Fixture::new();
+    let cache = fixture._temp.path().join("cache");
+    let alias = fixture._temp.path().join("cache-link");
+    fs::create_dir_all(&cache).unwrap();
+    symlink(&cache, &alias).unwrap();
+    let server = AssetServer::start();
+    let files: &[(&str, &[u8])] = &[("index.html", b"cached UI through a symlink")];
+    server.publish(&asset_manifest("1111111", files), files);
+    let remote = server.base_url();
+    let assets = tokio::task::spawn_blocking(move || resolve_remote_assets(&remote, &alias))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.state.assets = Arc::new(assets);
+
+    let response = router(fixture.state.clone())
+        .oneshot(fixture.request("GET", "/", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_QUACK_MESSAGE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"cached UI through a symlink");
 }
 
 #[tokio::test]

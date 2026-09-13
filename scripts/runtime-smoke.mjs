@@ -23,13 +23,57 @@ const duckdb = values.get('--duckdb');
 const extension = values.get('--extension');
 const quackExtension = values.get('--quack-extension');
 const httpfsExtension = values.get('--httpfs-extension');
+const repository = values.get('--repository');
 assert(
-  duckdb && extension && quackExtension && httpfsExtension,
-  'usage: runtime-smoke.mjs --duckdb PATH --extension PATH --quack-extension PATH --httpfs-extension PATH',
+  duckdb && (repository || (extension && quackExtension && httpfsExtension)),
+  'usage: runtime-smoke.mjs --duckdb PATH [--repository PREFIX | --extension PATH --quack-extension PATH --httpfs-extension PATH_OR_core]',
 );
-assert(statSync(extension).size > 0, `empty Sidequery UI extension: ${extension}`);
-assert(statSync(quackExtension).size > 0, `empty Quack extension: ${quackExtension}`);
-assert(statSync(httpfsExtension).size > 0, `empty httpfs extension: ${httpfsExtension}`);
+if (!repository) {
+  assert(statSync(extension).size > 0, `empty Sidequery UI extension: ${extension}`);
+  assert(statSync(quackExtension).size > 0, `empty Quack extension: ${quackExtension}`);
+  if (httpfsExtension !== 'core') {
+    assert(statSync(httpfsExtension).size > 0, `empty httpfs extension: ${httpfsExtension}`);
+  }
+}
+
+const queryTimeoutMs = repository || httpfsExtension === 'core' ? 120_000 : 20_000;
+const cliInit = repository
+  ? join(mkdtempSync(join(tmpdir(), 'sidequery-ui-cli-init.')), 'init.sql')
+  : '/dev/null';
+if (repository) {
+  // CREATE emits a result row; keep setup output separate from query assertions.
+  writeFileSync(cliInit, [
+    '.output /dev/null',
+    'set allow_unsigned_extensions = false;',
+    "set allow_extension_repositories = 'allowed';",
+    `create extension repository sidequery with prefix ${sqlLiteral(repository)};`,
+    '.output stdout',
+    '',
+  ].join('\n'));
+}
+const cliOptions = ['-init', cliInit, ...(repository ? [] : ['-unsigned'])];
+function cliEnvironment(home = mkdtempSync(join(tmpdir(), 'sidequery-ui-cli-home.'))) {
+  // DuckDB fixes its repository trust directory at startup under $HOME/.duckdb.
+  return { ...process.env, HOME: home };
+}
+function loadExtensions(includeUI = true) {
+  const statements = [];
+  if (repository || httpfsExtension === 'core') {
+    const state = mkdtempSync(join(tmpdir(), 'sidequery-ui-extensions.'));
+    statements.push(`set extension_directories = [${sqlLiteral(join(state, 'installed'))}]`);
+    statements.push('install httpfs from core', 'load httpfs from core');
+  } else {
+    statements.push(`load ${sqlLiteral(httpfsExtension)}`);
+  }
+  if (repository) {
+    statements.push('install quack from sidequery', 'load quack from sidequery');
+    if (includeUI) statements.push('install sidequery_ui from sidequery', 'load sidequery_ui from sidequery');
+  } else {
+    statements.push(`load ${sqlLiteral(quackExtension)}`);
+    if (includeUI) statements.push(`load ${sqlLiteral(extension)}`);
+  }
+  return statements.join('; ');
+}
 
 function sqlLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`;
@@ -45,10 +89,14 @@ writeFileSync(join(notebookRoot, 'nested', 'query.sql'), 'select 2;\n');
 writeFileSync(join(notebookRoot, 'ignored.txt'), 'not a notebook');
 symlinkSync(outsideRoot, join(notebookRoot, 'outside-link'));
 
-const child = spawn(duckdb, [':memory:', '-json'], { stdio: ['pipe', 'pipe', 'pipe'] });
+const child = spawn(duckdb, [...cliOptions, ':memory:', '-json'], {
+  stdio: ['pipe', 'pipe', 'pipe'],
+  env: cliEnvironment(),
+});
 let stdout = '';
 let stderr = '';
 const waiters = [];
+let expectedSQLFailures = 0;
 child.stderr.on('data', (chunk) => {
   stderr += chunk;
 });
@@ -68,7 +116,7 @@ function runSQL(sql) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(
       () => reject(new Error(`DuckDB output timeout for ${sql}\n${stderr}`)),
-      20_000,
+      queryTimeoutMs,
     );
     waiters.push((line) => {
       clearTimeout(timeout);
@@ -82,6 +130,27 @@ function runSQL(sql) {
   });
 }
 
+function expectSQLError(sql, expectedMessage) {
+  return new Promise((resolve, reject) => {
+    let received = '';
+    const timeout = setTimeout(() => {
+      child.stderr.off('data', onData);
+      reject(new Error(`Expected SQL error was not received for ${sql}: ${received}`));
+    }, queryTimeoutMs);
+    function onData(chunk) {
+      received += chunk;
+      if (expectedMessage.test(received)) {
+        clearTimeout(timeout);
+        child.stderr.off('data', onData);
+        expectedSQLFailures += 1;
+        resolve();
+      }
+    }
+    child.stderr.on('data', onData);
+    child.stdin.write(`${sql};\n`);
+  });
+}
+
 function firstValue(rows) {
   return Object.values(rows[0])[0];
 }
@@ -89,7 +158,7 @@ function firstValue(rows) {
 assert.equal(
   firstValue(
     await runSQL(
-      `load ${sqlLiteral(httpfsExtension)}; load ${sqlLiteral(quackExtension)}; load ${sqlLiteral(extension)}; select true as loaded`,
+      `${loadExtensions()}; select true as loaded`,
     ),
   ),
   true,
@@ -98,6 +167,14 @@ assert.equal(
   firstValue(await runSQL("select sidequery_ui_start(null, '', 0, false) is null as propagated")),
   true,
 );
+// Rejected start calls must not poison the database on runtimes that enforce fallibility.
+for (const argumentsSQL of ["'', '', -1, false", "'', '', -1, false, ''"]) {
+  await expectSQLError(
+    `select sidequery_ui_start(${argumentsSQL})`,
+    /port must be between 0 and 65535/,
+  );
+  assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
+}
 assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
 assert.equal(
   firstValue(await runSQL('create table shared_table as select 7::integer as value; select true')),
@@ -253,25 +330,27 @@ const endpoint = new URL(bootstrap.endpoint, start.baseUrl);
 const quackListenUrl = firstValue(await runSQL('select listen_url from quack_server_list()'));
 const directEndpoint = new URL(quackListenUrl);
 const directClientSQL = [
-  `load ${sqlLiteral(quackExtension)}`,
+  loadExtensions(false),
   `attach ${sqlLiteral(`quack:${directEndpoint.hostname}:${directEndpoint.port}`)} as sidequery_direct (token ${sqlLiteral(token)})`,
   'select value from sidequery_direct.main.shared_table',
 ].join('; ');
-const directClient = spawnSync(duckdb, [':memory:', '-csv', '-noheader', '-c', directClientSQL], {
+const directClient = spawnSync(duckdb, [...cliOptions, ':memory:', '-csv', '-noheader', '-c', directClientSQL], {
   encoding: 'utf8',
-  timeout: 20_000,
+  timeout: queryTimeoutMs,
+  env: cliEnvironment(),
 });
 assert.equal(directClient.status, 0, directClient.stderr || directClient.stdout);
 assert.equal(directClient.stdout.trim(), '7');
 
 const clientSQL = [
-  `load ${sqlLiteral(quackExtension)}`,
+  loadExtensions(false),
   `attach ${sqlLiteral(`quack:${endpoint.hostname}:${endpoint.port}`)} as sidequery_native (token ${sqlLiteral(token)})`,
   'select value from sidequery_native.main.shared_table',
 ].join('; ');
-const client = spawnSync(duckdb, [':memory:', '-csv', '-noheader', '-c', clientSQL], {
+const client = spawnSync(duckdb, [...cliOptions, ':memory:', '-csv', '-noheader', '-c', clientSQL], {
   encoding: 'utf8',
-  timeout: 20_000,
+  timeout: queryTimeoutMs,
+  env: cliEnvironment(),
 });
 assert.equal(client.status, 0, client.stderr || client.stdout);
 assert.equal(client.stdout.trim(), '7');
@@ -279,38 +358,43 @@ assert.equal(client.stdout.trim(), '7');
 const missingTemp = spawnSync(
   duckdb,
   [
+    ...cliOptions,
     ':memory:',
     '-csv',
     '-noheader',
     '-c',
     [
-      `load ${sqlLiteral(quackExtension)}`,
+      loadExtensions(false),
       `from quack_query(${sqlLiteral(`quack:${endpoint.hostname}:${endpoint.port}`)}, ${sqlLiteral('select * from caller_temp')}, token = ${sqlLiteral(token)})`,
     ].join('; '),
   ],
-  { encoding: 'utf8', timeout: 20_000 },
+  { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment() },
 );
 assert.notEqual(missingTemp.status, 0, 'Quack session must not see the caller temporary table');
 
-const remoteStop = spawnSync(
-  duckdb,
-  [
-    ':memory:',
-    '-csv',
-    '-noheader',
-    '-c',
+for (const ownerFunction of ['sidequery_ui_status', 'sidequery_ui_stop']) {
+  const rejectedOwnerCall = spawnSync(
+    duckdb,
     [
-      `load ${sqlLiteral(quackExtension)}`,
-      `from quack_query(${sqlLiteral(`quack:${endpoint.hostname}:${endpoint.port}`)}, ${sqlLiteral('select sidequery_ui_stop()')}, token = ${sqlLiteral(token)})`,
-    ].join('; '),
-  ],
-  { encoding: 'utf8', timeout: 20_000 },
-);
-assert.notEqual(remoteStop.status, 0, 'a Quack client must not stop its own server');
-assert.match(
-  `${remoteStop.stderr}\n${remoteStop.stdout}`,
-  /only be called from the connection that started the Sidequery UI/,
-);
+      ...cliOptions,
+      ':memory:',
+      '-csv',
+      '-noheader',
+      '-c',
+      [
+        loadExtensions(false),
+        `from quack_query(${sqlLiteral(`quack:${endpoint.hostname}:${endpoint.port}`)}, ${sqlLiteral(`select ${ownerFunction}()`)}, token = ${sqlLiteral(token)})`,
+      ].join('; '),
+    ],
+    { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment() },
+  );
+  assert.notEqual(rejectedOwnerCall.status, 0, `a Quack client must not call ${ownerFunction}`);
+  assert.match(
+    `${rejectedOwnerCall.stderr}\n${rejectedOwnerCall.stdout}`,
+    /only be called from the connection that started the Sidequery UI/,
+  );
+  assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
+}
 
 const serversBeforeStop = await runSQL('select count(*) as count from quack_server_list()');
 assert.equal(firstValue(serversBeforeStop), 1);
@@ -373,19 +457,18 @@ assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
 const externalAccessDisabled = spawnSync(
   duckdb,
   [
+    ...cliOptions,
     ':memory:',
     '-csv',
     '-noheader',
     '-c',
     [
-      `load ${sqlLiteral(httpfsExtension)}`,
-      `load ${sqlLiteral(quackExtension)}`,
-      `load ${sqlLiteral(extension)}`,
+      loadExtensions(),
       'set enable_external_access = false',
       `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false, ${sqlLiteral(notebookRoot)})`,
     ].join('; '),
   ],
-  { encoding: 'utf8', timeout: 20_000 },
+  { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment() },
 );
 assert.notEqual(externalAccessDisabled.status, 0);
 assert.match(
@@ -397,19 +480,18 @@ const defaultHome = mkdtempSync(join(tmpdir(), 'sidequery-ui-home.'));
 const defaultRootStart = spawnSync(
   duckdb,
   [
+    ...cliOptions,
     ':memory:',
     '-csv',
     '-noheader',
     '-c',
     [
-      `load ${sqlLiteral(httpfsExtension)}`,
-      `load ${sqlLiteral(quackExtension)}`,
-      `load ${sqlLiteral(extension)}`,
+      loadExtensions(),
       `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false)`,
       'select sidequery_ui_stop()',
     ].join('; '),
   ],
-  { encoding: 'utf8', timeout: 20_000, env: { ...process.env, HOME: defaultHome } },
+  { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment(defaultHome) },
 );
 assert.equal(defaultRootStart.status, 0, defaultRootStart.stderr || defaultRootStart.stdout);
 assert.equal(existsSync(join(defaultHome, 'Documents', 'sqlnb')), true);
@@ -417,7 +499,9 @@ assert.equal(existsSync(join(defaultHome, 'Documents', 'sqlnb')), true);
 child.stdin.end();
 await new Promise((resolve, reject) => {
   child.on('exit', (code) =>
-    code === 0 ? resolve() : reject(new Error(`DuckDB exited ${code}: ${stderr}`)),
+    code === (expectedSQLFailures > 0 ? 1 : 0)
+      ? resolve()
+      : reject(new Error(`DuckDB exited ${code}: ${stderr}`)),
   );
 });
 console.log(
