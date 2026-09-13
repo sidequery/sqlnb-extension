@@ -35,6 +35,9 @@ impl AssetServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS can inherit the listener's nonblocking mode.
+                        // Request threads must wait for complete HTTP headers.
+                        stream.set_nonblocking(false).unwrap();
                         let request_routes = thread_routes.clone();
                         thread::spawn(move || serve_asset_request(stream, &request_routes));
                     }
@@ -116,8 +119,13 @@ fn serve_asset_request(mut stream: TcpStream, routes: &AssetRoutes) {
             .unwrap_or((404, Vec::new(), Duration::ZERO));
     thread::sleep(delay);
     let reason = if status == 200 { "OK" } else { "Not Found" };
+    let location = if status == 307 {
+        format!("Location: {}\r\n", String::from_utf8_lossy(&body))
+    } else {
+        String::new()
+    };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -140,6 +148,109 @@ fn asset_manifest(version: &str, files: &[(&str, &[u8])]) -> AssetManifest {
             })
             .collect(),
     }
+}
+
+#[test]
+fn remote_assets_accept_canonical_index_redirect_and_verify_contents() {
+    let temp = TempDir::new().unwrap();
+    let server = AssetServer::start();
+    let files: &[(&str, &[u8])] = &[("index.html", b"release one")];
+    let mut manifest = asset_manifest("1111111", files);
+    manifest.asset_base = "1111111/".into();
+    server.publish(&manifest, files);
+    {
+        let mut routes = server.routes.lock().unwrap();
+        routes.insert(
+            "/ui/1111111/index.html".into(),
+            (307, b"/ui/1111111/".to_vec(), Duration::ZERO),
+        );
+        routes.insert(
+            "/ui/1111111/".into(),
+            (200, files[0].1.to_vec(), Duration::ZERO),
+        );
+    }
+    let assets = resolve_remote_assets(&server.base_url(), temp.path()).unwrap();
+    assert_eq!(
+        fs::read(assets.path.join("index.html")).unwrap(),
+        files[0].1
+    );
+
+    // A canonical redirect does not authorize different bytes.
+    server
+        .routes
+        .lock()
+        .unwrap()
+        .get_mut("/ui/1111111/")
+        .unwrap()
+        .1 = b"release bad".to_vec();
+    let empty_cache = TempDir::new().unwrap();
+    let error = resolve_remote_assets(&server.base_url(), empty_cache.path())
+        .err()
+        .unwrap();
+    assert!(error.contains("SHA-256 verification"), "{error}");
+}
+
+#[test]
+fn remote_assets_reject_redirects_outside_exact_index_directory() {
+    let server = AssetServer::start();
+    let files: &[(&str, &[u8])] = &[("index.html", b"release")];
+    for location in [
+        "https://example.com/ui/",
+        "/other/",
+        "/ui/?changed=1",
+        "/ui/index.html",
+    ] {
+        let temp = TempDir::new().unwrap();
+        server.publish(&asset_manifest("1111111", files), files);
+        server.routes.lock().unwrap().insert(
+            "/ui/index.html".into(),
+            (307, location.as_bytes().to_vec(), Duration::ZERO),
+        );
+        let error = resolve_remote_assets(&server.base_url(), temp.path())
+            .err()
+            .unwrap();
+        assert!(error.contains("307"), "{location}: {error}");
+    }
+}
+
+#[test]
+fn remote_assets_download_concurrently_within_shared_budget() {
+    let temp = TempDir::new().unwrap();
+    let server = AssetServer::start();
+    let files: &[(&str, &[u8])] = &[
+        ("a.js", b"a"),
+        ("b.js", b"b"),
+        ("c.js", b"c"),
+        ("d.js", b"d"),
+        ("e.js", b"e"),
+        ("f.js", b"f"),
+        ("g.js", b"g"),
+        ("index.html", b"index"),
+    ];
+    server.publish(&asset_manifest("1111111", files), files);
+    for (path, _) in files {
+        server.delay(&format!("/ui/{path}"), Duration::from_millis(250));
+    }
+    // Sequential requests need at least two seconds; concurrent downloads fit.
+    let assets = resolve_remote_assets_with_budget(
+        &server.base_url(),
+        temp.path(),
+        Duration::from_millis(1500),
+    )
+    .unwrap();
+    for (path, bytes) in files {
+        assert_eq!(fs::read(assets.path.join(path)).unwrap(), *bytes);
+    }
+}
+
+#[test]
+#[ignore = "downloads the current production UI; run explicitly for release validation"]
+fn remote_assets_live_published_ui() {
+    let temp = TempDir::new().unwrap();
+    let remote = parse_remote_asset_url("https://app.sidequery.dev/sqlnb/").unwrap();
+    let assets = resolve_remote_assets(&remote, temp.path()).unwrap();
+    validate_cached_generation(&assets.path, None).unwrap();
+    assert!(assets.path.join("index.html").is_file());
 }
 
 fn install_legacy_generation(
@@ -483,7 +594,9 @@ impl Fixture {
             duckdb_version: "test".into(),
             notebook_root: root.display().to_string(),
         };
-        let state = build_state(config, 4777).unwrap();
+        let mut state = build_state(config, 4777).unwrap();
+        Arc::get_mut(&mut state.notebooks).unwrap().recent_path =
+            Some(temp.path().join("preferences/recent.json"));
         Self {
             _temp: temp,
             root,
@@ -515,6 +628,143 @@ async fn json_body(response: Response) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn recent_notebook_survives_new_store_and_port_and_tracks_new_selection() {
+    let mut fixture = Fixture::new();
+    fs::write(fixture.root.join("first.sqlnb"), "select 1;").unwrap();
+    fs::write(fixture.root.join("second.sql"), "select 2;").unwrap();
+    let app = router(fixture.state.clone());
+    let response = app
+        .clone()
+        .oneshot(fixture.request("GET", "/api/v1/recent-notebook", None))
+        .await
+        .unwrap();
+    assert_eq!(json_body(response).await, json!({"path": null}));
+    for path in ["first.sqlnb", "second.sql"] {
+        let response = app
+            .clone()
+            .oneshot(fixture.request(
+                "PUT",
+                "/api/v1/recent-notebook",
+                Some(json!({"path": path})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, json!({"path": path}));
+    }
+    let preference = fixture.state.notebooks.recent_path.clone();
+    drop(app);
+    let mut reopened =
+        NotebookStore::open(notebook_root(&fixture.root.display().to_string()).unwrap()).unwrap();
+    reopened.recent_path = preference;
+    fixture.state.notebooks = Arc::new(reopened);
+    fixture.state.port = 4888;
+    fixture.state.origin = "http://127.0.0.1:4888".into();
+    let mut request = fixture.request("GET", "/api/v1/recent-notebook", None);
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static("127.0.0.1:4888"));
+    request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:4888"),
+    );
+    let response = router(fixture.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await, json!({"path": "second.sql"}));
+    assert_eq!(
+        fs::read_to_string(fixture.state.notebooks.recent_path.as_ref().unwrap()).unwrap(),
+        r#"{"path":"second.sql"}"#
+    );
+}
+
+#[tokio::test]
+async fn recent_notebook_rejects_unsafe_paths_and_unauthenticated_access() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("valid.sql"), "select 1;").unwrap();
+    let outside = fixture._temp.path().join("outside.sql");
+    fs::write(&outside, "select 9;").unwrap();
+    symlink(&outside, fixture.root.join("link.sql")).unwrap();
+    symlink(fixture._temp.path(), fixture.root.join("escape")).unwrap();
+    let app = router(fixture.state.clone());
+    for path in [
+        "../outside.sql",
+        "/outside.sql",
+        "bad.txt",
+        "",
+        "link.sql",
+        "escape/outside.sql",
+        "missing.sql",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(fixture.request(
+                "PUT",
+                "/api/v1/recent-notebook",
+                Some(json!({"path": path})),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.status().is_success(), "{path}");
+    }
+    for method in ["GET", "PUT"] {
+        let mut request = fixture.request(
+            method,
+            "/api/v1/recent-notebook",
+            (method == "PUT").then(|| json!({"path":"valid.sql"})),
+        );
+        request.headers_mut().remove(header::AUTHORIZATION);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(fixture.state.notebooks.recent(), None);
+}
+
+#[test]
+fn recent_notebook_falls_back_for_corruption_deleted_files_and_write_failure() {
+    let mut fixture = Fixture::new();
+    let store = Arc::get_mut(&mut fixture.state.notebooks).unwrap();
+    fs::write(fixture.root.join("valid.sql"), "select 1;").unwrap();
+    store.remember(Path::new("valid.sql")).unwrap();
+    let preference = store.recent_path.as_ref().unwrap().clone();
+    for bytes in [
+        "bad json",
+        r#"{"path":"../outside.sql"}"#,
+        r#"{"path":"missing.sql"}"#,
+    ] {
+        fs::write(&preference, bytes).unwrap();
+        assert_eq!(store.recent(), None);
+    }
+    store.remember(Path::new("valid.sql")).unwrap();
+    fs::remove_file(fixture.root.join("valid.sql")).unwrap();
+    assert_eq!(store.recent(), None);
+    fs::write(fixture.root.join("valid.sql"), "select 1;").unwrap();
+    store.recent_path = Some(preference.join("unwritable.json"));
+    assert!(store.remember(Path::new("valid.sql")).is_err());
+    assert_eq!(store.read(Path::new("valid.sql")).unwrap().0, "select 1;");
+    assert!(store.write(Path::new("new.sql"), b"select 2;", "").is_ok());
+}
+
+#[test]
+fn recent_notebook_scope_uses_canonical_root_not_server_identity() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let first_root = notebook_root(&first.root.display().to_string()).unwrap();
+    let equivalent = notebook_root(&first.root.join(".").display().to_string()).unwrap();
+    let second_root = notebook_root(&second.root.display().to_string()).unwrap();
+    assert_eq!(
+        cache_location::notebook_state_path(&first_root).unwrap(),
+        cache_location::notebook_state_path(&equivalent).unwrap()
+    );
+    assert_ne!(
+        cache_location::notebook_state_path(&first_root).unwrap(),
+        cache_location::notebook_state_path(&second_root).unwrap()
+    );
 }
 
 #[tokio::test]

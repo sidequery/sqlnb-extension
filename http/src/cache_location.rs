@@ -4,6 +4,20 @@ use std::path::PathBuf;
 use url::Url;
 
 pub(super) fn asset_cache_scope(remote: &Url) -> Result<PathBuf, String> {
+    Ok(cache_root()?
+        .join("sidequery/sqlnb-extension/ui")
+        .join(crate::revision(remote.as_str().as_bytes())))
+}
+
+pub(super) fn notebook_state_path(root: &std::path::Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(cache_root()?
+        .join("sidequery/sqlnb-extension/notebooks")
+        .join(crate::revision(root.as_os_str().as_bytes()))
+        .join("recent-notebook.json"))
+}
+
+fn cache_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     let root = PathBuf::from(
         std::env::var_os("HOME").ok_or("HOME is unavailable; cannot locate UI cache")?,
@@ -13,9 +27,7 @@ pub(super) fn asset_cache_scope(remote: &Url) -> Result<PathBuf, String> {
     let root = linux_cache_root(std::env::var_os("XDG_CACHE_HOME").as_deref(), || {
         std::env::var_os("HOME")
     })?;
-    Ok(root
-        .join("sidequery/sqlnb-extension/ui")
-        .join(crate::revision(remote.as_str().as_bytes())))
+    Ok(root)
 }
 
 #[cfg(any(target_os = "linux", test))]
