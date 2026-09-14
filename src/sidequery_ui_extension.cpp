@@ -87,7 +87,7 @@ static void LoadQuack(DatabaseInstance &database) {
     return;
   }
 #ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
-  auto &file_system = FileSystem::GetLocal(database);
+  auto &file_system = FileSystem::GetFileSystem(database);
   ExtensionRepository repository;
   if (ExtensionRepositoryManager::TryGetRepository(database, file_system, SIDEQUERY_REPOSITORY,
                                                     repository)) {
