@@ -14,6 +14,11 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
+#if __has_include("duckdb/main/extension_repository_manager.hpp")
+#include "duckdb/main/extension_repository_manager.hpp"
+#define SQLNB_HAS_USER_EXTENSION_REPOSITORIES 1
+#endif
+
 #include <openssl/rand.h>
 
 #include <cerrno>
@@ -33,6 +38,11 @@ extern char **environ;
 
 namespace duckdb {
 namespace {
+
+static constexpr const char *DEFAULT_SQLNB_UI = "https://app.sidequery.dev/sqlnb/";
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+static constexpr const char *SIDEQUERY_REPOSITORY = "sidequery";
+#endif
 
 static string JSONEscape(const string &value) {
   std::ostringstream out;
@@ -62,7 +72,7 @@ static string JSONEscape(const string &value) {
 static string RandomHex(idx_t bytes) {
   vector<unsigned char> random(bytes);
   if (RAND_bytes(random.data(), NumericCast<int>(random.size())) != 1) {
-    throw IOException("failed to generate a Sidequery UI capability");
+    throw IOException("failed to generate a SQLNB capability");
   }
   std::ostringstream out;
   out << std::hex << std::setfill('0');
@@ -72,6 +82,29 @@ static string RandomHex(idx_t bytes) {
   return out.str();
 }
 
+static void LoadQuack(DatabaseInstance &database) {
+  if (database.ExtensionIsLoaded("quack")) {
+    return;
+  }
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+  auto &file_system = FileSystem::GetLocal(database);
+  ExtensionRepository repository;
+  if (ExtensionRepositoryManager::TryGetRepository(database, file_system, SIDEQUERY_REPOSITORY,
+                                                    repository)) {
+    ExtensionInstallOptions install_options;
+    install_options.repository = &repository;
+    install_options.throw_on_origin_mismatch = true;
+    ExtensionHelper::InstallExtension(database, file_system, "quack", install_options);
+
+    ExtensionLoadOptions load_options("quack");
+    load_options.repository = repository.name;
+    ExtensionHelper::LoadExternalExtension(database, file_system, load_options);
+    return;
+  }
+#endif
+  ExtensionHelper::AutoLoadExtension(database, "quack");
+}
+
 static void EnsureDependenciesLoaded(DatabaseInstance &database) {
   // Source-column date profiles use timezone conversion. Load ICU before
   // accepting notebook queries so their first date query never installs it.
@@ -79,7 +112,7 @@ static void EnsureDependenciesLoaded(DatabaseInstance &database) {
     ExtensionHelper::AutoLoadExtension(database, "icu");
   }
   if (!database.ExtensionIsLoaded("icu")) {
-    throw MissingExtensionException("sidequery_ui requires the DuckDB icu extension for date profiles");
+    throw MissingExtensionException("SQLNB requires the DuckDB icu extension for date profiles");
   }
   // Quack uses DuckDB's writable crypto provider to generate session IDs.
   // For DuckDB 1.5.4 that provider is installed by the matching httpfs
@@ -88,13 +121,14 @@ static void EnsureDependenciesLoaded(DatabaseInstance &database) {
     ExtensionHelper::AutoLoadExtension(database, "httpfs");
   }
   if (!database.ExtensionIsLoaded("httpfs")) {
-    throw MissingExtensionException("sidequery_ui requires the DuckDB httpfs extension for Quack sessions");
+    throw MissingExtensionException("SQLNB requires the DuckDB httpfs extension for Quack sessions");
   }
   if (!database.ExtensionIsLoaded("quack")) {
-    ExtensionHelper::AutoLoadExtension(database, "quack");
+    LoadQuack(database);
   }
   if (!database.ExtensionIsLoaded("quack")) {
-    throw MissingExtensionException("sidequery_ui requires the DuckDB quack extension");
+    throw MissingExtensionException(
+        "SQLNB requires DuckDB Quack; install it from the same Sidequery extension repository");
   }
 }
 
@@ -136,10 +170,10 @@ static void StopQuack(DatabaseInstance &database, const string &listen_uri) {
   }
 }
 
-class SidequeryUIServer {
+class SqlnbServer {
 public:
-  SidequeryUIServer(shared_ptr<DatabaseInstance> database_p, const string &remote_url,
-                    const string &local_dir, int requested_port, const string &notebook_root)
+  SqlnbServer(shared_ptr<DatabaseInstance> database_p, const string &remote_url,
+              const string &local_dir, int requested_port, const string &notebook_root)
       : database(database_p), quack(StartQuack(*database_p)) {
     if (local_dir.empty() && remote_url.empty()) {
       StopQuack(*database_p, quack.listen_uri);
@@ -165,19 +199,19 @@ public:
         sidequery_http_string_free(error);
       }
       StopQuack(*database_p, quack.listen_uri);
-      throw IOException("failed to start Sidequery UI HTTP server: %s", message);
+      throw IOException("failed to start SQLNB HTTP server: %s", message);
     }
     auto actual_port = sidequery_http_port(http_server);
     if (actual_port == 0) {
       sidequery_http_stop(http_server);
       http_server = nullptr;
       StopQuack(*database_p, quack.listen_uri);
-      throw IOException("Sidequery UI HTTP server returned an invalid port");
+      throw IOException("SQLNB HTTP server returned an invalid port");
     }
     origin = "http://127.0.0.1:" + std::to_string(actual_port);
   }
 
-  ~SidequeryUIServer() {
+  ~SqlnbServer() {
     try {
       Stop();
     } catch (...) {
@@ -208,16 +242,16 @@ private:
   string origin;
 };
 
-class SidequeryUIState : public StorageExtensionInfo {
+class SqlnbState : public StorageExtensionInfo {
 public:
   string Start(shared_ptr<DatabaseInstance> database, const string &remote_url, const string &local_dir,
                int port, bool open_browser, const string &notebook_root, connection_t caller) {
     std::lock_guard<std::mutex> guard(lock);
     if (server) {
-      throw InvalidInputException("Sidequery UI is already running");
+      throw InvalidInputException("SQLNB is already running");
     }
-    auto candidate = make_uniq<SidequeryUIServer>(std::move(database), remote_url, local_dir, port,
-                                                   notebook_root);
+    auto candidate = make_uniq<SqlnbServer>(std::move(database), remote_url, local_dir, port,
+                                            notebook_root);
     auto launch_url = candidate->LaunchURL();
     if (open_browser) {
       OpenBrowser(launch_url);
@@ -232,18 +266,18 @@ public:
     if (!server) {
       return "{\"running\":false,\"bridgeVersion\":1,\"protocol\":\"quack\"}";
     }
-    RequireOwner(caller, "sidequery_ui_status");
+    RequireOwner(caller, "sqlnb_status");
     return StatusJSON(server->LaunchURL());
   }
 
   bool Stop(connection_t caller) {
-    unique_ptr<SidequeryUIServer> stopped;
+    unique_ptr<SqlnbServer> stopped;
     {
       std::lock_guard<std::mutex> guard(lock);
       if (!server) {
         return false;
       }
-      RequireOwner(caller, "sidequery_ui_stop");
+      RequireOwner(caller, "sqlnb_stop");
       stopped = std::move(server);
       owner_connection = DConstants::INVALID_INDEX;
     }
@@ -254,7 +288,7 @@ public:
 private:
   void RequireOwner(connection_t caller, const char *function) const {
     if (caller != owner_connection) {
-      throw InvalidInputException("%s may only be called from the connection that started the Sidequery UI",
+      throw InvalidInputException("%s may only be called from the connection that started SQLNB",
                                   function);
     }
   }
@@ -276,7 +310,7 @@ private:
     pid_t pid;
     char *arguments[] = {const_cast<char *>(program), const_cast<char *>(url.c_str()), nullptr};
     if (posix_spawnp(&pid, program, nullptr, nullptr, arguments, environ) != 0) {
-      throw IOException("failed to open Sidequery UI in the browser");
+      throw IOException("failed to open SQLNB in the browser");
     }
     std::thread([pid] {
       int status;
@@ -286,45 +320,46 @@ private:
 #else
     if (reinterpret_cast<intptr_t>(
             ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
-      throw IOException("failed to open Sidequery UI in the browser");
+      throw IOException("failed to open SQLNB in the browser");
     }
 #endif
   }
 
   std::mutex lock;
-  unique_ptr<SidequeryUIServer> server;
+  unique_ptr<SqlnbServer> server;
   connection_t owner_connection = DConstants::INVALID_INDEX;
 };
 
-static constexpr const char *SIDEQUERY_UI_STATE_KEY = "sidequery_ui_internal";
+static constexpr const char *SQLNB_STATE_KEY = "sqlnb_internal";
 
-static SidequeryUIState &GetState(DatabaseInstance &database) {
-  auto extension = StorageExtension::Find(database.config, SIDEQUERY_UI_STATE_KEY);
+static SqlnbState &GetState(DatabaseInstance &database) {
+  auto extension = StorageExtension::Find(database.config, SQLNB_STATE_KEY);
   if (!extension || !extension->storage_info) {
-    throw InternalException("sidequery_ui state is unavailable");
+    throw InternalException("SQLNB state is unavailable");
   }
-  return *static_cast<SidequeryUIState *>(extension->storage_info.get());
+  return *static_cast<SqlnbState *>(extension->storage_info.get());
 }
 
 static void StartFunction(DataChunk &args, ExpressionState &state, Vector &result) {
   if (!args.AllConstant()) {
-    throw InvalidInputException("sidequery_ui_start arguments must be constant");
+    throw InvalidInputException("sqlnb_start arguments must be constant");
   }
   for (idx_t column = 0; column < args.ColumnCount(); column++) {
     if (args.data[column].GetValue(0).IsNull()) {
-      throw InvalidInputException("sidequery_ui_start arguments must not be NULL");
+      throw InvalidInputException("sqlnb_start arguments must not be NULL");
     }
   }
-  auto remote_url = args.data[0].GetValue(0).GetValue<string>();
-  auto local_dir = args.data[1].GetValue(0).GetValue<string>();
-  auto port = args.data[2].GetValue(0).GetValue<int32_t>();
-  auto open_browser = args.data[3].GetValue(0).GetValue<bool>();
-  auto notebook_root = args.ColumnCount() == 5 ? args.data[4].GetValue(0).GetValue<string>() : string();
+  auto remote_url = args.ColumnCount() > 0 ? args.data[0].GetValue(0).GetValue<string>()
+                                           : string(DEFAULT_SQLNB_UI);
+  auto local_dir = args.ColumnCount() > 1 ? args.data[1].GetValue(0).GetValue<string>() : string();
+  auto port = args.ColumnCount() > 2 ? args.data[2].GetValue(0).GetValue<int32_t>() : 0;
+  auto open_browser = args.ColumnCount() > 3 ? args.data[3].GetValue(0).GetValue<bool>() : true;
+  auto notebook_root = args.ColumnCount() > 4 ? args.data[4].GetValue(0).GetValue<string>() : string();
   if (port < 0 || port > 65535) {
     throw InvalidInputException("port must be between 0 and 65535");
   }
   if (!Settings::Get<EnableExternalAccessSetting>(state.GetContext())) {
-    throw PermissionException("sidequery_ui requires enable_external_access=true for notebook file access");
+    throw PermissionException("SQLNB requires enable_external_access=true for notebook file access");
   }
   auto &database = *state.GetContext().db;
   result.SetValue(0, Value(GetState(database).Start(state.GetContext().db, remote_url, local_dir, port,
@@ -346,43 +381,73 @@ static void StopFunction(DataChunk &, ExpressionState &state, Vector &result) {
 
 static void LoadInternal(ExtensionLoader &loader) {
   auto state_extension = make_shared_ptr<StorageExtension>();
-  state_extension->storage_info = make_uniq<SidequeryUIState>();
-  StorageExtension::Register(loader.GetDatabaseInstance().config, SIDEQUERY_UI_STATE_KEY,
+  state_extension->storage_info = make_uniq<SqlnbState>();
+  StorageExtension::Register(loader.GetDatabaseInstance().config, SQLNB_STATE_KEY,
                              state_extension);
-  ScalarFunctionSet starts("sidequery_ui_start");
+
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+  FunctionSignature sqlnb_start_signature(
+      {FunctionParameter("ui", LogicalType::VARCHAR, Value(DEFAULT_SQLNB_UI)),
+       FunctionParameter("assets", LogicalType::VARCHAR, Value("")),
+       FunctionParameter("port", LogicalType::INTEGER, Value::INTEGER(0)),
+       FunctionParameter("open_browser", LogicalType::BOOLEAN, Value::BOOLEAN(true)),
+       FunctionParameter("notebook_root", LogicalType::VARCHAR, Value(""))},
+      LogicalType::VARCHAR);
+  ScalarFunction sqlnb_start("sqlnb_start", std::move(sqlnb_start_signature), StartFunction);
+  sqlnb_start.SetVolatile();
+  sqlnb_start.SetFallible();
+  loader.RegisterFunction(sqlnb_start);
+#else
+  ScalarFunction sqlnb_start("sqlnb_start", {}, LogicalType::VARCHAR, StartFunction);
+  sqlnb_start.SetVolatile();
+  sqlnb_start.SetFallible();
+  loader.RegisterFunction(sqlnb_start);
+#endif
+
+  ScalarFunctionSet compatibility_starts("sidequery_ui_start");
   ScalarFunction start_four({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
                              LogicalType::BOOLEAN},
                             LogicalType::VARCHAR, StartFunction);
   start_four.SetVolatile();
   start_four.SetFallible();
-  starts.AddFunction(start_four);
+  compatibility_starts.AddFunction(start_four);
   ScalarFunction start_five({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
                              LogicalType::BOOLEAN, LogicalType::VARCHAR},
                             LogicalType::VARCHAR, StartFunction);
   start_five.SetVolatile();
   start_five.SetFallible();
-  starts.AddFunction(start_five);
-  loader.RegisterFunction(starts);
-  ScalarFunction status("sidequery_ui_status", {}, LogicalType::VARCHAR, StatusFunction);
+  compatibility_starts.AddFunction(start_five);
+  loader.RegisterFunction(compatibility_starts);
+
+  ScalarFunction status("sqlnb_status", {}, LogicalType::VARCHAR, StatusFunction);
   status.SetVolatile();
   status.SetFallible();
   loader.RegisterFunction(status);
-  ScalarFunction stop("sidequery_ui_stop", {}, LogicalType::BOOLEAN, StopFunction);
+  ScalarFunction compatibility_status("sidequery_ui_status", {}, LogicalType::VARCHAR, StatusFunction);
+  compatibility_status.SetVolatile();
+  compatibility_status.SetFallible();
+  loader.RegisterFunction(compatibility_status);
+
+  ScalarFunction stop("sqlnb_stop", {}, LogicalType::BOOLEAN, StopFunction);
   stop.SetVolatile();
   stop.SetFallible();
   loader.RegisterFunction(stop);
+  ScalarFunction compatibility_stop("sidequery_ui_stop", {}, LogicalType::BOOLEAN, StopFunction);
+  compatibility_stop.SetVolatile();
+  compatibility_stop.SetFallible();
+  loader.RegisterFunction(compatibility_stop);
 }
 
 } // namespace
 
-void SidequeryUiExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
-std::string SidequeryUiExtension::Name() { return "sidequery_ui"; }
-std::string SidequeryUiExtension::Version() const { return "v0.1.0"; }
+void SqlnbExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
+std::string SqlnbExtension::Name() { return "sqlnb"; }
+std::string SqlnbExtension::Version() const { return "v0.1.0"; }
 
 } // namespace duckdb
 
 extern "C" {
-DUCKDB_CPP_EXTENSION_ENTRY(sidequery_ui, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(sqlnb, loader) {
   duckdb::LoadInternal(loader);
 }
 }

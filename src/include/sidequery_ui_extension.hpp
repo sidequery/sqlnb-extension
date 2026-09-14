@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class SidequeryUiExtension : public Extension {
+class SqlnbExtension : public Extension {
 public:
   void Load(ExtensionLoader &loader) override;
   std::string Name() override;
