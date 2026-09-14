@@ -29,14 +29,14 @@ case "$(uname -s):$(uname -m)" in
     vcpkg_triplet="arm64-linux"
     ;;
   *)
-    echo "Unsupported Sidequery UI build host: $(uname -s) $(uname -m)" >&2
+    echo "Unsupported SQLNB build host: $(uname -s) $(uname -m)" >&2
     exit 1
     ;;
 esac
 
 for tool in bun cargo cmake git ninja python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "Missing required Sidequery UI build tool: $tool" >&2
+    echo "Missing required SQLNB build tool: $tool" >&2
     exit 1
   fi
 done
@@ -165,12 +165,12 @@ if [[ "$(git -C "$build_dir/_deps/httpfs_extension_fc-src" rev-parse HEAD)" != "
   echo "Release httpfs checkout did not resolve to $HTTPFS_REVISION" >&2
   exit 1
 fi
-cmake --build "$build_dir" --target duckdb httpfs_loadable_extension quack_loadable_extension sidequery_ui_loadable_extension --parallel
+cmake --build "$build_dir" --target duckdb httpfs_loadable_extension quack_loadable_extension sqlnb_loadable_extension --parallel
 
 duckdb_binary="$build_dir/duckdb"
 quack_artifact="$build_dir/extension/quack/quack.duckdb_extension"
 httpfs_artifact="$build_dir/extension/httpfs/httpfs.duckdb_extension"
-sidequery_artifact="$build_dir/extension/sidequery_ui/sidequery_ui.duckdb_extension"
+sidequery_artifact="$build_dir/extension/sqlnb/sqlnb.duckdb_extension"
 test -x "$duckdb_binary"
 test -s "$quack_artifact"
 test -s "$httpfs_artifact"
@@ -183,7 +183,7 @@ artifact_stage="$(mktemp -d "$artifact_parent/.${duckdb_platform}.new.XXXXXX")"
 cp "$duckdb_binary" "$artifact_stage/duckdb"
 cp "$quack_artifact" "$artifact_stage/quack.duckdb_extension"
 cp "$httpfs_artifact" "$artifact_stage/httpfs.duckdb_extension"
-cp "$sidequery_artifact" "$artifact_stage/sidequery_ui.duckdb_extension"
+cp "$sidequery_artifact" "$artifact_stage/sqlnb.duckdb_extension"
 {
   echo "duckdb_version=$DUCKDB_VERSION"
   echo "duckdb_revision=$DUCKDB_REVISION"
@@ -193,9 +193,9 @@ cp "$sidequery_artifact" "$artifact_stage/sidequery_ui.duckdb_extension"
   echo "duckdb_platform=$duckdb_platform"
 } >"$artifact_stage/manifest.txt"
 if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$artifact_stage" && sha256sum duckdb httpfs.duckdb_extension quack.duckdb_extension sidequery_ui.duckdb_extension >SHA256SUMS)
+  (cd "$artifact_stage" && sha256sum duckdb httpfs.duckdb_extension quack.duckdb_extension sqlnb.duckdb_extension >SHA256SUMS)
 else
-  (cd "$artifact_stage" && shasum -a 256 duckdb httpfs.duckdb_extension quack.duckdb_extension sidequery_ui.duckdb_extension >SHA256SUMS)
+  (cd "$artifact_stage" && shasum -a 256 duckdb httpfs.duckdb_extension quack.duckdb_extension sqlnb.duckdb_extension >SHA256SUMS)
 fi
 
 # Rename complete directories so a running CLI never observes a partially
@@ -209,4 +209,4 @@ if [[ -e "$artifact_previous" ]]; then
   rm -rf -- "$artifact_previous"
 fi
 
-echo "Retained runnable DuckDB, Quack, and Sidequery UI artifacts in $artifact_dir"
+echo "Retained runnable DuckDB, Quack, and SQLNB artifacts in $artifact_dir"

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.12)
 
-set(TARGET_NAME sidequery_ui)
+set(TARGET_NAME sqlnb)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
@@ -21,7 +21,7 @@ file(GLOB_RECURSE SIDEQUERY_HTTP_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/http/src/*.rs)
 set(SIDEQUERY_HTTP_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/http-cargo)
 if(NOT UNIX)
-  message(FATAL_ERROR "sidequery_ui's local notebook server currently supports macOS and Linux")
+  message(FATAL_ERROR "SQLNB's local notebook server currently supports macOS and Linux")
 endif()
 set(SIDEQUERY_HTTP_LIBRARY ${SIDEQUERY_HTTP_TARGET_DIR}/release/libsidequery_http.a)
 
@@ -36,9 +36,9 @@ else()
   else()
     find_program(SIDEQUERY_CARGO_EXECUTABLE cargo)
     if(NOT SIDEQUERY_CARGO_EXECUTABLE)
-      message(FATAL_ERROR "building sidequery_ui requires mbx or cargo")
+      message(FATAL_ERROR "building SQLNB requires mbx or cargo")
     endif()
-    message(STATUS "repo mbx wrapper unavailable; building sidequery_ui HTTP library with Cargo")
+    message(STATUS "repo mbx wrapper unavailable; building SQLNB HTTP library with Cargo")
     set(SIDEQUERY_CARGO_BUILD ${SIDEQUERY_CARGO_EXECUTABLE} build)
   endif()
 endif()

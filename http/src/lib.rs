@@ -429,7 +429,7 @@ fn resolve_remote_assets_with_budget(
                 generation
             }
             Err(cache_error) => return Err(format!(
-                "failed to update Sidequery UI assets ({update_error}); no valid cached UI is available ({cache_error})"
+                "failed to update SQLNB assets ({update_error}); no valid cached UI is available ({cache_error})"
             )),
         },
     };
@@ -665,7 +665,7 @@ fn fetch_limited(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| "Sidequery UI asset update exceeded its overall budget".to_string())?;
+        .ok_or_else(|| "SQLNB asset update exceeded its overall budget".to_string())?;
     let response = client
         .get(url.clone())
         .timeout(remaining.min(Duration::from_secs(30)))
@@ -2173,13 +2173,13 @@ fn router(state: AppState) -> Router {
 fn start(config: ServerConfig) -> Result<ServerHandle, String> {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
     let listener = TcpListener::bind(address)
-        .map_err(|error| format!("failed to bind Sidequery UI to 127.0.0.1: {error}"))?;
+        .map_err(|error| format!("failed to bind SQLNB to 127.0.0.1: {error}"))?;
     listener
         .set_nonblocking(true)
-        .map_err(|error| format!("failed to configure Sidequery UI listener: {error}"))?;
+        .map_err(|error| format!("failed to configure SQLNB listener: {error}"))?;
     let port = listener
         .local_addr()
-        .map_err(|error| format!("failed to inspect Sidequery UI listener: {error}"))?
+        .map_err(|error| format!("failed to inspect SQLNB listener: {error}"))?
         .port();
     let state = build_state(config, port)?;
     let app = router(state);
@@ -2217,7 +2217,7 @@ fn start(config: ServerConfig) -> Result<ServerHandle, String> {
                     .await;
             });
         })
-        .map_err(|error| format!("failed to start Sidequery UI server thread: {error}"))?;
+        .map_err(|error| format!("failed to start SQLNB server thread: {error}"))?;
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -2227,7 +2227,7 @@ fn start(config: ServerConfig) -> Result<ServerHandle, String> {
         Err(_) => {
             let _ = shutdown.send(true);
             let _ = thread.join();
-            return Err("Sidequery UI server did not become ready".into());
+            return Err("SQLNB server did not become ready".into());
         }
     }
     Ok(ServerHandle {
@@ -2273,7 +2273,7 @@ pub extern "C" fn sidequery_http_start(
         Err(_) => {
             set_error(
                 error_out,
-                "unexpected panic while starting Sidequery UI server".into(),
+                "unexpected panic while starting SQLNB server".into(),
             );
             ptr::null_mut()
         }

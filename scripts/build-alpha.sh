@@ -76,14 +76,14 @@ cmake -S "$source_dir" -B "$build_dir" -G Ninja \
   -DOPENSSL_CRYPTO_LIBRARY="$openssl_source_dir/libcrypto.a" \
   -DOPENSSL_SSL_LIBRARY="$openssl_source_dir/libssl.a"
 [[ "$(git -C "$build_dir/_deps/quack_extension_fc-src" rev-parse HEAD)" == "$QUACK_REVISION" ]]
-cmake --build "$build_dir" --target quack_loadable_extension sidequery_ui_loadable_extension --parallel "$jobs"
+cmake --build "$build_dir" --target quack_loadable_extension sqlnb_loadable_extension --parallel "$jobs"
 # Runtime validation uses the official matching httpfs, which remains in core.
 bun "$extension_dir/scripts/runtime-smoke.mjs" --duckdb "$duckdb_binary" \
-  --extension "$build_dir/extension/sidequery_ui/sidequery_ui.duckdb_extension" \
+  --extension "$build_dir/extension/sqlnb/sqlnb.duckdb_extension" \
   --quack-extension "$build_dir/extension/quack/quack.duckdb_extension" --httpfs-extension core
 mkdir -p "$artifact_dir"
 cp "$build_dir/extension/quack/quack.duckdb_extension" "$artifact_dir/"
-cp "$build_dir/extension/sidequery_ui/sidequery_ui.duckdb_extension" "$artifact_dir/"
+cp "$build_dir/extension/sqlnb/sqlnb.duckdb_extension" "$artifact_dir/"
 {
   echo "duckdb_version=$DUCKDB_VERSION"
   echo "duckdb_revision=$DUCKDB_REVISION"
@@ -100,5 +100,5 @@ cp "$build_dir/extension/sidequery_ui/sidequery_ui.duckdb_extension" "$artifact_
     echo "native_source_dirty=true"
   fi
 } > "$artifact_dir/manifest.txt"
-(cd "$artifact_dir" && shasum -a 256 quack.duckdb_extension sidequery_ui.duckdb_extension > SHA256SUMS)
+(cd "$artifact_dir" && shasum -a 256 quack.duckdb_extension sqlnb.duckdb_extension > SHA256SUMS)
 echo "Validated alpha extensions: $artifact_dir"

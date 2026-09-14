@@ -4,11 +4,21 @@ A native DuckDB shell for Sidequery's remotely deployed notebook UI. SQL execute
 
 ## Remote UI and updates
 
-Configure the stable Sidequery UI URL once. Each `sidequery_ui_start` checks its `manifest.json`, downloads a complete new generation, verifies file sizes and SHA-256 hashes, and activates it in the local disk cache. A failed download or unavailable server falls back to a verified cached generation, including an older release if the active cache is damaged. The first launch needs a reachable compatible UI release.
+`sqlnb_start()` uses the production SQLNB UI by default. Each start checks its `manifest.json`, downloads a complete new generation, verifies file sizes and SHA-256 hashes, and activates it in the local disk cache. A failed download or unavailable server falls back to a verified cached generation, including an older release if the active cache is damaged. The first launch needs a reachable compatible UI release.
 
 The running server keeps its chosen generation, so an update cannot mix assets or reload a notebook with unsaved edits. Stop and start the UI to pick up a newly deployed release. Normal UI updates do not require rebuilding or reinstalling the extension.
 
 Sidequery's UI publishing path is `https://app.sidequery.dev/sqlnb/`. Its publishing integration is being delivered separately; this repository does not deploy it.
+
+With the Sidequery extension repository configured, the installed SQLNB flow is:
+
+```sql
+install sqlnb from sidequery;
+load sqlnb from sidequery;
+select sqlnb_start();
+```
+
+On supported DuckDB alpha builds, SQLNB installs and loads Quack from the same trusted Sidequery repository when it starts. It also loads the matching core `httpfs` and `icu` extensions through DuckDB's normal core autoloading policy, so those dependencies do not need separate `load` statements.
 
 ## Build and run
 
@@ -24,11 +34,24 @@ Load the three matching artifacts in the DuckDB session, using absolute paths:
 ```sql
 load '/absolute/path/to/sqlnb-extension/.artifacts/osx_arm64/httpfs.duckdb_extension';
 load '/absolute/path/to/sqlnb-extension/.artifacts/osx_arm64/quack.duckdb_extension';
-load '/absolute/path/to/sqlnb-extension/.artifacts/osx_arm64/sidequery_ui.duckdb_extension';
-select sidequery_ui_start('https://app.sidequery.dev/sqlnb/', '', 0, true, '~/Documents/sqlnb');
+load '/absolute/path/to/sqlnb-extension/.artifacts/osx_arm64/sqlnb.duckdb_extension';
+select sqlnb_start();
 ```
 
-The database process must remain running. `sidequery_ui_status()` reports its local URL; `sidequery_ui_stop()` stops the UI server. Notebook listing, saving, folders, and moves use the extension's local file API without browser filesystem permissions.
+The database process must remain running. `sqlnb_status()` reports its local URL; `sqlnb_stop()` stops the UI server. Notebook listing, saving, folders, and moves use the extension's local file API without browser filesystem permissions.
+
+On DuckDB 2.0 alpha builds, startup options are named and optional. Override only what you need:
+
+```sql
+select sqlnb_start(
+  ui := 'https://example.com/sqlnb/',
+  port := 4567,
+  open_browser := false,
+  notebook_root := '~/Documents/notebooks'
+);
+```
+
+For local UI development, use `assets := '/absolute/path/to/assets'`; local assets take precedence over `ui`. Existing `sidequery_ui_start(...)`, `sidequery_ui_status()`, and `sidequery_ui_stop()` calls remain available as compatibility aliases.
 
 The authenticated `GET /api/v1/recent-notebook` endpoint returns `{ "path": "relative.sqlnb" }`, or `{ "path": null }` when no readable recent notebook is available. The UI records a successful open or save using `PUT` to the same endpoint with `{ "path": "relative.sqlnb" }`. The path must identify an existing notebook within the configured root. This preference survives server restarts and port changes and is isolated by canonical notebook root under the OS cache's `sidequery/sqlnb-extension/notebooks` directory. It contains only the relative path; unavailable or corrupt preferences do not affect normal notebook file operations.
 
@@ -42,7 +65,7 @@ On Linux, an absolute `XDG_CACHE_HOME` works even when `HOME` is unset. Empty or
 
 New releases live in a separate `managed-v1` directory. Cache cleanup retains the current release, one verified fallback, and releases leased by running extension instances. Obsolete managed releases are removed after their leases are released. Older cache directories are kept as read-only offline fallbacks, since older extension processes do not support leases and may still be using them.
 
-For development, the second argument to `sidequery_ui_start` accepts an absolute local asset directory and takes precedence over the remote URL. No UI source checkout or frontend build is required by the installed extension.
+No UI source checkout or frontend build is required by the installed extension.
 
 ## Private repository alpha build
 
@@ -53,7 +76,7 @@ use the official `v2.0.0-alpha41489` CLI (source `10de957379`):
 scripts/build-alpha.sh --duckdb /absolute/path/to/alpha41489/duckdb
 ```
 
-This macOS build compiles only Quack and `sidequery_ui` against that exact source,
+This macOS build compiles only Quack and `sqlnb` against that exact source,
 applies its upstream Quack compatibility patches, and runs the Rust and native
 smoke suites, including the live deployed UI check. It fetches and verifies pinned
 OpenSSL 3.6.3, then builds its static libraries for the same macOS 11.0 deployment
@@ -81,6 +104,6 @@ bun scripts/runtime-smoke.mjs --duckdb /absolute/path/to/alpha41489/duckdb \
 ```
 
 A local repository directory is also accepted. Each client uses fresh extension
-and trust directories, allows only signed extensions, and installs Quack and
-`sidequery_ui` from Sidequery. The suite checks queries, notebook files, caller
+and trust directories, allows only signed extensions, and proves that starting
+`sqlnb` bootstraps Quack from Sidequery. The suite checks queries, notebook files, caller
 isolation, authentication, server cleanup, and remote UI generation updates.

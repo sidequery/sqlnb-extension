@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -29,7 +30,7 @@ assert(
   'usage: runtime-smoke.mjs --duckdb PATH [--repository PREFIX | --extension PATH --quack-extension PATH --httpfs-extension PATH_OR_core]',
 );
 if (!repository) {
-  assert(statSync(extension).size > 0, `empty Sidequery UI extension: ${extension}`);
+  assert(statSync(extension).size > 0, `empty SQLNB extension: ${extension}`);
   assert(statSync(quackExtension).size > 0, `empty Quack extension: ${quackExtension}`);
   if (httpfsExtension !== 'core') {
     assert(statSync(httpfsExtension).size > 0, `empty httpfs extension: ${httpfsExtension}`);
@@ -61,13 +62,19 @@ function loadExtensions(includeUI = true) {
   if (repository || httpfsExtension === 'core') {
     const state = mkdtempSync(join(tmpdir(), 'sidequery-ui-extensions.'));
     statements.push(`set extension_directories = [${sqlLiteral(join(state, 'installed'))}]`);
-    statements.push('install httpfs from core', 'load httpfs from core');
+    if (!repository || !includeUI) {
+      statements.push('install httpfs from core', 'load httpfs from core');
+    }
   } else {
     statements.push(`load ${sqlLiteral(httpfsExtension)}`);
   }
   if (repository) {
-    statements.push('install quack from sidequery', 'load quack from sidequery');
-    if (includeUI) statements.push('install sidequery_ui from sidequery', 'load sidequery_ui from sidequery');
+    if (includeUI) {
+      // SQLNB installs and loads its private Quack dependency from this repository.
+      statements.push('install sqlnb from sidequery', 'load sqlnb from sidequery');
+    } else {
+      statements.push('install quack from sidequery', 'load quack from sidequery');
+    }
   } else {
     statements.push(`load ${sqlLiteral(quackExtension)}`);
     if (includeUI) statements.push(`load ${sqlLiteral(extension)}`);
@@ -167,14 +174,19 @@ assert.equal(
   firstValue(await runSQL("select sidequery_ui_start(null, '', 0, false) is null as propagated")),
   true,
 );
-// Rejected start calls must not poison the database on runtimes that enforce fallibility.
-for (const argumentsSQL of ["'', '', -1, false", "'', '', -1, false, ''"]) {
-  await expectSQLError(
-    `select sidequery_ui_start(${argumentsSQL})`,
-    /port must be between 0 and 65535/,
+// The old positional entrypoint remains available for existing callers.
+for (const functionName of ['sidequery_ui_status', 'sidequery_ui_stop']) {
+  assert.equal(
+    firstValue(await runSQL(`select count(*) from duckdb_functions() where function_name = '${functionName}'`)),
+    1,
   );
-  assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
 }
+// Rejected start calls must not poison the database on runtimes that enforce fallibility.
+await expectSQLError(
+  'select sqlnb_start(port := -1, open_browser := false)',
+  /port must be between 0 and 65535/,
+);
+assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
 assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
 assert.equal(
   firstValue(await runSQL('create table shared_table as select 7::integer as value; select true')),
@@ -185,7 +197,7 @@ assert.equal(
   true,
 );
 const startRows = await runSQL(
-  `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+  `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
 );
 const start = JSON.parse(firstValue(startRows));
 assert.equal(start.engine, 'native-duckdb');
@@ -207,7 +219,7 @@ assert(token, `missing launch capability: ${start.launchUrl}`);
 assert.equal(
   firstValue(
     await runSQL(
-      'select count(*) as count from (select sidequery_ui_status() as status from range(3)) where status is not null',
+      'select count(*) as count from (select sqlnb_status() as status from range(3)) where status is not null',
     ),
   ),
   3,
@@ -383,7 +395,7 @@ const missingTemp = spawnSync(
 );
 assert.notEqual(missingTemp.status, 0, 'Quack session must not see the caller temporary table');
 
-for (const ownerFunction of ['sidequery_ui_status', 'sidequery_ui_stop']) {
+for (const ownerFunction of ['sqlnb_status', 'sqlnb_stop']) {
   const rejectedOwnerCall = spawnSync(
     duckdb,
     [
@@ -402,14 +414,14 @@ for (const ownerFunction of ['sidequery_ui_status', 'sidequery_ui_stop']) {
   assert.notEqual(rejectedOwnerCall.status, 0, `a Quack client must not call ${ownerFunction}`);
   assert.match(
     `${rejectedOwnerCall.stderr}\n${rejectedOwnerCall.stdout}`,
-    /only be called from the connection that started the Sidequery UI/,
+    /only be called from the connection that started SQLNB/,
   );
   assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
 }
 
 const serversBeforeStop = await runSQL('select count(*) as count from quack_server_list()');
 assert.equal(firstValue(serversBeforeStop), 1);
-assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
+assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
 
 const upstreamPaths = [];
@@ -442,7 +454,7 @@ const upstream = createServer((request, response) => {
 await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
 const upstreamPort = upstream.address().port;
 const remoteRows = await runSQL(
-  `select sidequery_ui_start('http://127.0.0.1:${upstreamPort}/notebook/', '', 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+  `select sqlnb_start(ui := 'http://127.0.0.1:${upstreamPort}/notebook/', open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
 );
 const remote = JSON.parse(firstValue(remoteRows));
 const remoteAsset = await fetch(`${remote.baseUrl}/asset.js`);
@@ -451,19 +463,19 @@ assert.match(await remoteAsset.text(), /sidequeryRemoteFixture = 'one'/);
 assert.equal((await fetch(`${remote.baseUrl}/../outside`)).status, 404);
 assert(upstreamPaths.includes('/notebook/manifest.json'));
 assert(!upstreamPaths.includes('/notebook/outside'));
-assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
+assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 release = 'two';
 const updatedUi = JSON.parse(firstValue(await runSQL(
-  `select sidequery_ui_start('http://127.0.0.1:${upstreamPort}/notebook/', '', 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+  `select sqlnb_start(ui := 'http://127.0.0.1:${upstreamPort}/notebook/', open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
 )));
 assert.match(await (await fetch(`${updatedUi.baseUrl}/asset.js`)).text(), /sidequeryRemoteFixture = 'two'/);
-assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
+assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 await new Promise((resolve) => upstream.close(resolve));
 const offline = JSON.parse(firstValue(await runSQL(
-  `select sidequery_ui_start('http://127.0.0.1:${upstreamPort}/notebook/', '', 0, false, ${sqlLiteral(notebookRoot)}) as status`,
+  `select sqlnb_start(ui := 'http://127.0.0.1:${upstreamPort}/notebook/', open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
 )));
 assert.match(await (await fetch(`${offline.baseUrl}/asset.js`)).text(), /sidequeryRemoteFixture = 'two'/);
-assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
+assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 
 const externalAccessDisabled = spawnSync(
   duckdb,
@@ -476,7 +488,7 @@ const externalAccessDisabled = spawnSync(
     [
       loadExtensions(),
       'set enable_external_access = false',
-      `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false, ${sqlLiteral(notebookRoot)})`,
+      'select sqlnb_start()',
     ].join('; '),
   ],
   { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment() },
@@ -498,14 +510,47 @@ const defaultRootStart = spawnSync(
     '-c',
     [
       loadExtensions(),
-      `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false)`,
-      'select sidequery_ui_stop()',
+      `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false)`,
+      'select sqlnb_stop()',
     ].join('; '),
   ],
   { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment(defaultHome) },
 );
 assert.equal(defaultRootStart.status, 0, defaultRootStart.stderr || defaultRootStart.stdout);
 assert.equal(existsSync(join(defaultHome, 'Documents', 'sqlnb')), true);
+
+const zeroArgumentHome = mkdtempSync(join(tmpdir(), 'sidequery-ui-zero-argument-home.'));
+const fakeBin = join(zeroArgumentHome, 'bin');
+mkdirSync(fakeBin);
+writeFileSync(join(fakeBin, 'open'), '#!/bin/sh\nexit 0\n');
+chmodSync(join(fakeBin, 'open'), 0o755);
+const zeroArgumentStart = spawnSync(
+  duckdb,
+  [
+    ...cliOptions,
+    ':memory:',
+    '-csv',
+    '-noheader',
+    '-c',
+    [loadExtensions(), 'select sqlnb_start()', 'select sqlnb_stop()'].join('; '),
+  ],
+  {
+    encoding: 'utf8',
+    timeout: queryTimeoutMs,
+    env: {
+      ...cliEnvironment(zeroArgumentHome),
+      PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+    },
+  },
+);
+assert.equal(zeroArgumentStart.status, 0, zeroArgumentStart.stderr || zeroArgumentStart.stdout);
+assert.equal(existsSync(join(zeroArgumentHome, 'Documents', 'sqlnb')), true);
+
+const compatibilityStart = JSON.parse(firstValue(await runSQL(
+  `select sidequery_ui_start('', ${sqlLiteral(fixture)}, 0, false, ${sqlLiteral(notebookRoot)})`,
+)));
+assert.equal(compatibilityStart.engine, 'native-duckdb');
+assert.equal(firstValue(await runSQL('select sidequery_ui_stop()')), true);
 
 child.stdin.end();
 await new Promise((resolve, reject) => {
@@ -516,5 +561,5 @@ await new Promise((resolve, reject) => {
   );
 });
 console.log(
-  'native Sidequery UI bootstrap, official Quack query, extension-owned notebook files, isolation, shutdown, security, and asset proxy smoke passed',
+  'native SQLNB bootstrap, named/default options, compatibility aliases, official Quack query, extension-owned notebook files, isolation, shutdown, security, and asset proxy smoke passed',
 );

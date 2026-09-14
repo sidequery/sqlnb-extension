@@ -12,4 +12,4 @@ duckdb_extension_load(quack
   GIT_TAG 40de7badae4193c29d9c0834473fb76acc6c51e6
 )
 
-duckdb_extension_load(sidequery_ui SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR})
+duckdb_extension_load(sqlnb SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR})
