@@ -593,6 +593,7 @@ impl Fixture {
             token: "test-capability".into(),
             duckdb_version: "test".into(),
             notebook_root: root.display().to_string(),
+            mcp_token: String::new(),
         };
         let mut state = build_state(config, 4777).unwrap();
         Arc::get_mut(&mut state.notebooks).unwrap().recent_path =
@@ -1306,4 +1307,120 @@ fn ffi_server_binds_reports_port_and_stops() {
     );
     assert_ne!(sidequery_http_port(handle), 0);
     sidequery_http_stop(handle);
+}
+
+#[tokio::test]
+async fn mcp_is_opt_in_and_has_an_independent_capability() {
+    let mut fixture = Fixture::new();
+    let response = router(fixture.state.clone())
+        .oneshot(fixture.request("POST", "/mcp", Some(serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    fixture.state.mcp_token = "agent-capability".into();
+    let app = router(fixture.state.clone());
+    let response = app
+        .clone()
+        .oneshot(fixture.request("POST", "/mcp", Some(serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bootstrap = json_body(
+        app.clone()
+            .oneshot(fixture.request("GET", "/api/v1/bootstrap", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bootstrap["mcpBridge"], true);
+    assert!(!bootstrap.to_string().contains("agent-capability"));
+    let mut request = fixture.request("POST", "/mcp", Some(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})));
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer agent-capability"),
+    );
+    request.headers_mut().insert(
+        header::ACCEPT,
+        HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_QUACK_MESSAGE_BYTES)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let message = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|data| !data.is_empty())
+        .unwrap_or(&body);
+    let initialized: Value = serde_json::from_str(message).unwrap();
+    assert_eq!(
+        initialized["result"]["capabilities"]["tools"],
+        serde_json::json!({})
+    );
+    let mut hostile = fixture.request("POST", "/mcp", Some(serde_json::json!({})));
+    hostile.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer agent-capability"),
+    );
+    hostile.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+    assert_eq!(
+        app.oneshot(hostile).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    fixture.state.mcp_shutdown.cancel();
+}
+
+#[tokio::test]
+async fn mcp_saved_notebooks_use_revisions_and_root_boundaries() {
+    let fixture = Fixture::new();
+    let server = mcp::McpServer(fixture.state.clone());
+    let live = server
+        .execute(
+            "list_live_notebooks",
+            serde_json::json!({}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live, serde_json::json!({"sessions": []}));
+    let created = server
+        .execute(
+            "write_notebook",
+            serde_json::json!({
+                "notebook_path":"mcp.sqlnb", "source":"select 1", "expected_revision":""
+            }),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let saved = server
+        .execute(
+            "read_notebook",
+            serde_json::json!({"notebook_path":"mcp.sqlnb"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["source"], "select 1");
+    assert_eq!(saved["revision"], created["revision"]);
+    let updated = server.execute("write_notebook", serde_json::json!({
+        "notebook_path":"mcp.sqlnb", "source":"select 2", "expected_revision":created["revision"]
+    }), tokio_util::sync::CancellationToken::new()).await.unwrap();
+    assert_ne!(updated["revision"], created["revision"]);
+    assert!(server.execute("write_notebook", serde_json::json!({
+        "notebook_path":"mcp.sqlnb", "source":"select 3", "expected_revision":created["revision"]
+    }), tokio_util::sync::CancellationToken::new()).await.unwrap_err().contains("changed"));
+    assert!(server
+        .execute(
+            "read_notebook",
+            serde_json::json!({"notebook_path":"../escape.sqlnb"}),
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_err());
 }
