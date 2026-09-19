@@ -107,3 +107,72 @@ A local repository directory is also accepted. Each client uses fresh extension
 and trust directories, allows only signed extensions, and proves that starting
 `sqlnb` bootstraps Quack from Sidequery. The suite checks queries, notebook files, caller
 isolation, authentication, server cleanup, and remote UI generation updates.
+
+## Local MCP server
+
+MCP is disabled by default. On DuckDB alpha, enable it explicitly:
+
+```sql
+select sqlnb_start(mcp := true, notebook_root := '~/Documents/notebooks');
+select sqlnb_status();
+```
+
+The returned status contains `mcp.enabled`, `mcp.url` (the loopback `/mcp`
+Streamable HTTP endpoint), and `mcp.token`. Configure an MCP client with that URL
+and an `Authorization: Bearer <mcp.token>` header. The token is separate from the
+browser capability, changes at every start, and is available only from the SQL
+connection that started the server. Do not put it in a URL. The server rejects
+foreign browser origins and Host headers. `sqlnb_stop()` stops both surfaces;
+closing the owning SQL connection also stops a server started with MCP enabled.
+
+On the stable compatibility interface, the sixth positional argument enables MCP:
+
+```sql
+select sidequery_ui_start(
+  'https://app.sidequery.dev/sqlnb/', '', 0, true,
+  '~/Documents/notebooks', true
+);
+```
+
+The server exposes these tools:
+
+| Tool | Arguments and behavior |
+| --- | --- |
+| `query` | `sql`, optional `max_rows` (1–1000). Executes one SQL statement; results have a 1 MiB limit and a 30-second deadline. SQL can modify data. |
+| `inspect_schema` | Lists database schema columns visible to the agent connection, under the same result bounds. |
+| `list_notebooks` | Lists saved notebook paths beneath the configured root. |
+| `read_notebook` | `notebook_path`; returns saved source and revision. |
+| `write_notebook` | `notebook_path`, `source`, `expected_revision`; an empty revision creates a file, an existing file requires its current revision. |
+| `list_live_notebooks` | Returns `{sessions: [...]}` containing each browser's `session_id`, `notebook_path` and current `revision`. |
+| `execute_live_notebook` | `session_id`, `expected_revision`, `operation`, optional `arguments`; targets exactly one connected browser document. |
+
+SQL tools use one persistent agent connection to the existing DuckDB database,
+shared by MCP clients for this server's lifetime. It is separate from the browser's
+Quack connection: database objects are shared, but temporary tables, transactions,
+and connection settings are not. Native query cancellation interrupts only its
+matching query and finishes cleanup before reusing the connection. BIGINT,
+DECIMAL, date/time and nested values are returned as strings to preserve precision.
+
+Live operations are `notebook.get`, `notebook.run`, `cell.insert`, `cell.update`,
+`cell.delete` and `cell.run`. Address existing cells with `cell_id` or zero-based
+`cell_index`; `cell.insert` uses zero-based `position`. Cell edits accept `sql`,
+`title`, `display_title`, `connection` and `markdown` as applicable. `notebook.get`
+accepts `run: none|missing|all`; edits accept `run: none|cell|affected`, defaulting
+to `none`. Edits change the open document and remain unsaved until the user saves.
+For example, after obtaining a session's current revision:
+
+```json
+{
+  "session_id": "<session_id>",
+  "expected_revision": "<revision>",
+  "operation": "cell.update",
+  "arguments": {"cell_index": 0, "sql": "select 42 as answer", "run": "cell"}
+}
+```
+
+The browser bridge rejects stale revisions and does not replay delivered commands.
+A timeout or cancellation stops subsequent cells, but Quack cannot interrupt a
+browser query already running. Inspect the document before retrying a mutation.
+Saved-file writes reject paths currently reported open by connected browsers;
+use live operations for unsaved documents. Browser polling leases expire after
+five seconds without a heartbeat, and live calls time out after 30 seconds.

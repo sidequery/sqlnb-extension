@@ -8,6 +8,7 @@
 #include "sidequery_http.h"
 
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -22,6 +23,8 @@
 #include <openssl/rand.h>
 
 #include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -170,10 +173,163 @@ static void StopQuack(DatabaseInstance &database, const string &listen_uri) {
   }
 }
 
+// The owner connection's cleanup hook releases this connection, avoiding a
+// database -> extension state -> agent connection -> database reference cycle.
+class McpConnection {
+public:
+  explicit McpConnection(DatabaseInstance &database) : connection(database) {}
+
+  static char *Query(void *context, uint64_t id, const char *sql, uint64_t max_rows,
+                     uint64_t max_bytes) noexcept {
+    auto &self = *static_cast<McpConnection *>(context);
+    std::lock_guard<std::mutex> serial(self.query_lock);
+    {
+      std::lock_guard<std::mutex> guard(self.active_lock);
+      self.active_id = id;
+      self.cancelled = false;
+    }
+    string response;
+    try {
+      response = self.Execute(sql, max_rows, max_bytes);
+    } catch (const std::exception &error) {
+      response = "{\"error\":" + JSONEscape(error.what()) + "}";
+    } catch (...) {
+      response = "{\"error\":\"unexpected DuckDB query failure\"}";
+    }
+    {
+      std::lock_guard<std::mutex> guard(self.active_lock);
+      if (self.cancelled) {
+        response = "{\"error\":\"query cancelled\"}";
+      }
+      self.active_id = 0;
+    }
+    auto result = static_cast<char *>(std::malloc(response.size() + 1));
+    if (result) {
+      std::memcpy(result, response.c_str(), response.size() + 1);
+    }
+    return result;
+  }
+
+  static void Interrupt(void *context, uint64_t id) noexcept {
+    auto &self = *static_cast<McpConnection *>(context);
+    std::lock_guard<std::mutex> guard(self.active_lock);
+    if (id != 0 && self.active_id == id) {
+      self.cancelled = true;
+      self.connection.Interrupt();
+    }
+  }
+
+  static void Free(char *result) { std::free(result); }
+
+private:
+  static string JSONValue(const Value &value) {
+    if (value.IsNull()) {
+      return "null";
+    }
+    switch (value.type().id()) {
+    case LogicalTypeId::BOOLEAN:
+      return value.GetValue<bool>() ? "true" : "false";
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+      return value.ToString();
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+      if (std::isfinite(value.GetValue<double>())) {
+        return value.ToString();
+      }
+      break;
+    default:
+      break;
+    }
+    // Preserve BIGINT, DECIMAL, dates and nested values without JSON precision loss.
+    return JSONEscape(value.ToString());
+  }
+
+  string Execute(const char *sql, uint64_t max_rows, uint64_t max_bytes) {
+    max_rows = std::min<uint64_t>(max_rows, 10000);
+    max_bytes = std::min<uint64_t>(max_bytes, 4 * 1024 * 1024);
+    auto statements = connection.ExtractStatements(sql);
+    if (statements.size() != 1) {
+      throw InvalidInputException("MCP queries must contain exactly one SQL statement");
+    }
+    auto result = connection.SendQuery(std::move(statements[0]));
+    if (!result || result->HasError()) {
+      throw IOException("%s", result ? result->GetError() : "query returned no result");
+    }
+    string response = "{\"columns\":[";
+    string types = "],\"types\":[";
+    vector<string> names;
+    unordered_set<string> used_names;
+    for (idx_t column = 0; column < result->ColumnCount(); column++) {
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      auto original_name = result->ColumnName(column).GetIdentifierName();
+      auto type = result->GetTypes()[column];
+#else
+      auto original_name = result->names[column];
+      auto type = result->types[column];
+#endif
+      auto name = original_name;
+      auto suffix = 1;
+      while (!used_names.insert(name).second) {
+        name = original_name + "_" + std::to_string(suffix++);
+      }
+      names.push_back(name);
+      response += (column ? "," : "") + JSONEscape(name);
+      types += (column ? "," : "") + JSONEscape(type.ToString());
+    }
+    response += types + "],\"rows\":[";
+    if (response.size() + 128 > max_bytes) {
+      throw InvalidInputException("query column metadata exceeds result byte limit");
+    }
+    uint64_t count = 0;
+    bool truncated = false;
+    while (auto chunk = result->Fetch()) {
+      for (idx_t row = 0; row < chunk->size(); row++) {
+        if (count >= max_rows) {
+          truncated = true;
+          break;
+        }
+        string object = "{";
+        for (idx_t column = 0; column < names.size(); column++) {
+          object += (column ? "," : "") + JSONEscape(names[column]) + ":" +
+                    JSONValue(chunk->GetValue(column, row));
+          if (response.size() + object.size() + 128 > max_bytes) {
+            truncated = true;
+            break;
+          }
+        }
+        if (truncated) {
+          break;
+        }
+        response += (count ? "," : "") + object + "}";
+        count++;
+      }
+      if (truncated) {
+        break;
+      }
+    }
+    if (result->HasError()) {
+      throw IOException("%s", result->GetError());
+    }
+    return response + "],\"returned_rows\":" + std::to_string(count) +
+           ",\"truncated\":" + (truncated ? "true}" : "false}");
+  }
+
+  Connection connection;
+  std::mutex query_lock;
+  std::mutex active_lock;
+  uint64_t active_id = 0;
+  bool cancelled = false;
+};
+
 class SqlnbServer {
 public:
   SqlnbServer(shared_ptr<DatabaseInstance> database_p, const string &remote_url,
-              const string &local_dir, int requested_port, const string &notebook_root)
+              const string &local_dir, int requested_port, const string &notebook_root, bool mcp)
       : database(database_p), quack(StartQuack(*database_p)) {
     if (local_dir.empty() && remote_url.empty()) {
       StopQuack(*database_p, quack.listen_uri);
@@ -184,15 +340,22 @@ public:
       quack_url.push_back('/');
     }
     quack_url += "quack";
+    if (mcp) {
+      mcp_token = RandomHex(32);
+      mcp_connection = make_uniq<McpConnection>(*database_p);
+    }
     auto config = "{\"port\":" + std::to_string(requested_port) +
                   ",\"localAssetDirectory\":" + JSONEscape(local_dir) +
                   ",\"remoteAssetUrl\":" + JSONEscape(remote_url) +
                   ",\"quackUrl\":" + JSONEscape(quack_url) +
                   ",\"token\":" + JSONEscape(quack.token) +
                   ",\"duckdbVersion\":" + JSONEscape(DuckDB::LibraryVersion()) +
-                  ",\"notebookRoot\":" + JSONEscape(notebook_root) + "}";
+                  ",\"notebookRoot\":" + JSONEscape(notebook_root) +
+                  ",\"mcpToken\":" + JSONEscape(mcp_token) + "}";
     char *error = nullptr;
-    http_server = sidequery_http_start(config.c_str(), &error);
+    http_server = sidequery_http_start_with_query(config.c_str(), mcp_connection.get(),
+                                                  McpConnection::Query, McpConnection::Interrupt,
+                                                  McpConnection::Free, &error);
     if (!http_server) {
       string message = error ? error : "unknown error";
       if (error) {
@@ -220,12 +383,18 @@ public:
 
   string LaunchURL() const { return origin + "/#sidequery_token=" + quack.token; }
   string Origin() const { return origin; }
+  string McpStatus() const {
+    return mcp_token.empty() ? "{\"enabled\":false}"
+                            : "{\"enabled\":true,\"url\":" + JSONEscape(origin + "/mcp") +
+                                  ",\"token\":" + JSONEscape(mcp_token) + "}";
+  }
 
   void Stop() {
     if (http_server) {
       sidequery_http_stop(http_server);
       http_server = nullptr;
     }
+    mcp_connection.reset();
     if (!quack.listen_uri.empty()) {
       auto listen_uri = std::move(quack.listen_uri);
       auto owner = database.lock();
@@ -240,18 +409,20 @@ private:
   QuackEndpoint quack;
   void *http_server = nullptr;
   string origin;
+  string mcp_token;
+  unique_ptr<McpConnection> mcp_connection;
 };
 
 class SqlnbState : public StorageExtensionInfo {
 public:
   string Start(shared_ptr<DatabaseInstance> database, const string &remote_url, const string &local_dir,
-               int port, bool open_browser, const string &notebook_root, connection_t caller) {
+               int port, bool open_browser, const string &notebook_root, bool mcp, connection_t caller) {
     std::lock_guard<std::mutex> guard(lock);
     if (server) {
       throw InvalidInputException("SQLNB is already running");
     }
     auto candidate = make_uniq<SqlnbServer>(std::move(database), remote_url, local_dir, port,
-                                            notebook_root);
+                                            notebook_root, mcp);
     auto launch_url = candidate->LaunchURL();
     if (open_browser) {
       OpenBrowser(launch_url);
@@ -296,7 +467,8 @@ private:
   string StatusJSON(const string &launch_url) const {
     return "{\"running\":true,\"bridgeVersion\":1,\"protocol\":\"quack\","
            "\"engine\":\"native-duckdb\",\"baseUrl\":" +
-           JSONEscape(server->Origin()) + ",\"launchUrl\":" + JSONEscape(launch_url) + "}";
+           JSONEscape(server->Origin()) + ",\"launchUrl\":" + JSONEscape(launch_url) +
+           ",\"mcp\":" + server->McpStatus() + "}";
   }
 
   static void OpenBrowser(const string &url) {
@@ -340,6 +512,20 @@ static SqlnbState &GetState(DatabaseInstance &database) {
   return *static_cast<SqlnbState *>(extension->storage_info.get());
 }
 
+class McpOwnerCleanup : public ClientContextState {
+public:
+  McpOwnerCleanup(SqlnbState &state_p, connection_t owner_p) : state(state_p), owner(owner_p) {}
+  ~McpOwnerCleanup() override {
+    try {
+      state.Stop(owner);
+    } catch (...) {
+    }
+  }
+private:
+  SqlnbState &state;
+  connection_t owner;
+};
+
 static void StartFunction(DataChunk &args, ExpressionState &state, Vector &result) {
   if (!args.AllConstant()) {
     throw InvalidInputException("sqlnb_start arguments must be constant");
@@ -355,6 +541,7 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   auto port = args.ColumnCount() > 2 ? args.data[2].GetValue(0).GetValue<int32_t>() : 0;
   auto open_browser = args.ColumnCount() > 3 ? args.data[3].GetValue(0).GetValue<bool>() : true;
   auto notebook_root = args.ColumnCount() > 4 ? args.data[4].GetValue(0).GetValue<string>() : string();
+  auto mcp = args.ColumnCount() > 5 ? args.data[5].GetValue(0).GetValue<bool>() : false;
   if (port < 0 || port > 65535) {
     throw InvalidInputException("port must be between 0 and 65535");
   }
@@ -363,8 +550,12 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   }
   auto &database = *state.GetContext().db;
   result.SetValue(0, Value(GetState(database).Start(state.GetContext().db, remote_url, local_dir, port,
-                                                    open_browser, notebook_root,
+                                                    open_browser, notebook_root, mcp,
                                                     state.GetContext().GetConnectionId())));
+  if (mcp) {
+    state.GetContext().registered_state->GetOrCreate<McpOwnerCleanup>(
+        "sqlnb_mcp_owner", GetState(database), state.GetContext().GetConnectionId());
+  }
   result.SetVectorType(VectorType::CONSTANT_VECTOR);
 }
 
@@ -391,7 +582,8 @@ static void LoadInternal(ExtensionLoader &loader) {
        FunctionParameter("assets", LogicalType::VARCHAR, Value("")),
        FunctionParameter("port", LogicalType::INTEGER, Value::INTEGER(0)),
        FunctionParameter("open_browser", LogicalType::BOOLEAN, Value::BOOLEAN(true)),
-       FunctionParameter("notebook_root", LogicalType::VARCHAR, Value(""))},
+       FunctionParameter("notebook_root", LogicalType::VARCHAR, Value("")),
+       FunctionParameter("mcp", LogicalType::BOOLEAN, Value::BOOLEAN(false))},
       LogicalType::VARCHAR);
   ScalarFunction sqlnb_start("sqlnb_start", std::move(sqlnb_start_signature), StartFunction);
   sqlnb_start.SetVolatile();
@@ -417,6 +609,12 @@ static void LoadInternal(ExtensionLoader &loader) {
   start_five.SetVolatile();
   start_five.SetFallible();
   compatibility_starts.AddFunction(start_five);
+  ScalarFunction start_six({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+                            LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                           LogicalType::VARCHAR, StartFunction);
+  start_six.SetVolatile();
+  start_six.SetFallible();
+  compatibility_starts.AddFunction(start_six);
   loader.RegisterFunction(compatibility_starts);
 
   ScalarFunction status("sqlnb_status", {}, LogicalType::VARCHAR, StatusFunction);
