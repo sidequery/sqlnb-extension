@@ -342,6 +342,85 @@ assert(symlinkWriteResponse.status >= 400);
 assert.equal(existsSync(join(outsideRoot, 'escaped.sqlnb')), false);
 assert.equal(readFileSync(join(notebookRoot, 'first.sqlnb'), 'utf8'), updatedSource);
 
+// Exercise the public history/Git contract through the actual loaded extension.
+async function notebookApi(path, method = 'GET', body) {
+  const response = await fetch(`${start.baseUrl}/api/v1/${path}`, {
+    method,
+    headers: { ...headers, 'content-type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  return result;
+}
+assert.equal((await fetch(`${start.baseUrl}/api/v1/history?path=first.sqlnb`)).status, 401);
+assert.equal((await fetch(`${start.baseUrl}/api/v1/git`)).status, 401);
+const historyBefore = await notebookApi('history?path=first.sqlnb');
+assert(historyBefore.revisions.length >= 2, 'baseline and accepted save must be retained');
+const baselineRevision = historyBefore.revisions.at(-1);
+const historicalSource = await notebookApi(`history/revision?path=first.sqlnb&id=${baselineRevision.id}`);
+assert.equal(historicalSource.source, first.source);
+const restoredFile = await notebookApi('history/restore', 'POST', {
+  path: 'first.sqlnb', id: baselineRevision.id, expectedRevision: updated.revision,
+});
+assert.equal(readFileSync(join(notebookRoot, 'first.sqlnb'), 'utf8'), first.source);
+assert.equal((await notebookApi('history?path=first.sqlnb')).revisions[0].reason, 'restore');
+await notebookApi('file', 'PUT', {
+  path: 'first.sqlnb', source: updatedSource, expectedRevision: restoredFile.revision,
+});
+const beforeNoop = (await notebookApi('history?path=first.sqlnb')).revisions.length;
+await notebookApi('file', 'PUT', {
+  path: 'first.sqlnb', source: updatedSource, expectedRevision: updated.revision,
+});
+assert.equal((await notebookApi('history?path=first.sqlnb')).revisions.length, beforeNoop);
+
+function fixtureGit(args, cwd = notebookRoot) {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  assert.equal(result.status, 0, `fixture Git ${args[0]} failed`);
+  return result.stdout.trim();
+}
+await notebookApi('git/init', 'POST', {});
+fixtureGit(['config', 'user.name', 'SQLNB smoke']);
+fixtureGit(['config', 'user.email', 'sqlnb-smoke@localhost']);
+fixtureGit(['config', 'commit.gpgsign', 'false']);
+writeFileSync(join(notebookRoot, 'unrelated.txt'), 'keep this staged\n');
+fixtureGit(['add', '--', 'unrelated.txt']);
+let gitStatus = await notebookApi('git');
+assert(gitStatus.available);
+assert.equal(gitStatus.head, null);
+assert(gitStatus.files.every((entry) => /\.(sql|sqlnb)$/.test(entry.path)));
+await notebookApi('git/stage', 'POST', {
+  paths: ['first.sqlnb'], expectedHead: gitStatus.head, expectedIndex: gitStatus.indexRevision,
+});
+gitStatus = await notebookApi('git');
+assert.match((await notebookApi('git/diff?path=first.sqlnb&staged=true')).diff, /select 42/);
+const initialCommit = await notebookApi('git/commit', 'POST', {
+  paths: ['first.sqlnb'], message: 'Initial notebook', expectedHead: gitStatus.head, expectedIndex: gitStatus.indexRevision,
+});
+assert.equal(fixtureGit(['show', 'HEAD:first.sqlnb']), updatedSource.trim());
+assert.equal(fixtureGit(['diff', '--cached', '--name-only']), 'unrelated.txt');
+assert.equal(fixtureGit(['rev-parse', 'HEAD']), initialCommit.head);
+
+// A local bare remote verifies push behavior without publishing user work.
+const remoteRoot = mkdtempSync(join(tmpdir(), 'sqlnb-smoke-remote.'));
+fixtureGit(['init', '--bare'], remoteRoot);
+fixtureGit(['remote', 'add', 'origin', remoteRoot]);
+fixtureGit(['push', '--set-upstream', 'origin', fixtureGit(['branch', '--show-current'])]);
+await notebookApi('file', 'PUT', {
+  path: 'first.sqlnb', source: 'select 43;\n', expectedRevision: updated.revision,
+});
+gitStatus = await notebookApi('git');
+await notebookApi('git/stage', 'POST', {
+  paths: ['first.sqlnb'], expectedHead: gitStatus.head, expectedIndex: gitStatus.indexRevision,
+});
+gitStatus = await notebookApi('git');
+const nextCommit = await notebookApi('git/commit', 'POST', {
+  paths: ['first.sqlnb'], message: 'Update notebook', expectedHead: gitStatus.head, expectedIndex: gitStatus.indexRevision,
+});
+await notebookApi('git/push', 'POST', { expectedHead: nextCommit.head });
+assert.equal(fixtureGit(['rev-parse', `refs/heads/${gitStatus.branch}`], remoteRoot), nextCommit.head);
+assert.equal(fixtureGit(['diff', '--cached', '--name-only']), 'unrelated.txt');
+
 const rejectedProxy = await fetch(`${start.baseUrl}/quack`, {
   method: 'POST',
   headers: { 'content-type': 'application/vnd.duckdb', origin: 'https://attacker.example' },
@@ -561,5 +640,5 @@ await new Promise((resolve, reject) => {
   );
 });
 console.log(
-  'native SQLNB bootstrap, named/default options, compatibility aliases, official Quack query, extension-owned notebook files, isolation, shutdown, security, and asset proxy smoke passed',
+  'native SQLNB bootstrap, named/default options, compatibility aliases, official Quack query, notebook history/restore, scoped Git commits/push, isolation, shutdown, security, and asset proxy smoke passed',
 );

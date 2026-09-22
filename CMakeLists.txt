@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/sidequery_ui_extension.cpp)
@@ -61,7 +62,7 @@ build_loadable_extension(${TARGET_NAME} "" ${EXTENSION_SOURCES})
 
 foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   add_dependencies(${target} sidequery_http_build)
-  target_link_libraries(${target} sidequery_http OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
+  target_link_libraries(${target} sidequery_http OpenSSL::Crypto ZLIB::ZLIB Threads::Threads ${CMAKE_DL_LIBS})
   if(APPLE)
     target_link_libraries(${target} iconv)
   elseif(UNIX)

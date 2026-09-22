@@ -11,6 +11,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 axum = { version = "0.7", features = ["json", "query"] }
 bytes = "1"
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 http-body-util = "0.1"
 libc = "0.2"
 mime_guess = "2"
