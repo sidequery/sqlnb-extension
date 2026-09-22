@@ -593,6 +593,7 @@ impl Fixture {
             token: "test-capability".into(),
             duckdb_version: "test".into(),
             notebook_root: root.display().to_string(),
+            mcp_token: String::new(),
         };
         let mut state = build_state(config, 4777).unwrap();
         Arc::get_mut(&mut state.notebooks).unwrap().recent_path =
@@ -1391,6 +1392,7 @@ fn history_polling_captures_external_changes_and_stops_with_server() {
         remote_asset_url: String::new(),
         quack_url: "http://127.0.0.1:49999/quack".into(),
         token: "test".into(),
+        mcp_token: String::new(),
         duckdb_version: "test".into(),
         notebook_root: notebooks.display().to_string(),
     })
@@ -1426,4 +1428,206 @@ fn history_polling_captures_external_changes_and_stops_with_server() {
         store.history.lock().unwrap().list("external.sql").len(),
         count
     );
+}
+
+#[tokio::test]
+async fn mcp_is_opt_in_and_has_an_independent_capability() {
+    let mut fixture = Fixture::new();
+    let response = router(fixture.state.clone())
+        .oneshot(fixture.request("POST", "/mcp", Some(serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    fixture.state.mcp_token = "agent-capability".into();
+    let app = router(fixture.state.clone());
+    let response = app
+        .clone()
+        .oneshot(fixture.request("POST", "/mcp", Some(serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bootstrap = json_body(
+        app.clone()
+            .oneshot(fixture.request("GET", "/api/v1/bootstrap", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bootstrap["mcpBridge"], true);
+    assert!(!bootstrap.to_string().contains("agent-capability"));
+    let mut request = fixture.request("POST", "/mcp", Some(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})));
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer agent-capability"),
+    );
+    request.headers_mut().insert(
+        header::ACCEPT,
+        HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_QUACK_MESSAGE_BYTES)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let message = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|data| !data.is_empty())
+        .unwrap_or(&body);
+    let initialized: Value = serde_json::from_str(message).unwrap();
+    assert_eq!(
+        initialized["result"]["capabilities"]["tools"],
+        serde_json::json!({})
+    );
+    let mut hostile = fixture.request("POST", "/mcp", Some(serde_json::json!({})));
+    hostile.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer agent-capability"),
+    );
+    hostile.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+    assert_eq!(
+        app.oneshot(hostile).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    fixture.state.mcp_shutdown.cancel();
+}
+
+#[tokio::test]
+async fn mcp_saved_notebooks_use_revisions_and_root_boundaries() {
+    let fixture = Fixture::new();
+    let server = mcp::McpServer(fixture.state.clone());
+    let live = server
+        .execute(
+            "sidequery.notebook.sql.list",
+            serde_json::json!({}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live["sessions"], serde_json::json!([]));
+    assert_eq!(live["operation"], "notebook.list");
+    let created = server
+        .execute(
+            "sidequery.notebook.sql.source.write",
+            serde_json::json!({
+                "notebook_path":"mcp.sqlnb", "source":"select 1", "expected_revision":""
+            }),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let saved = server
+        .execute(
+            "sidequery.notebook.sql.source.read",
+            serde_json::json!({"notebook_path":"mcp.sqlnb"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["source"], "select 1");
+    assert_eq!(saved["revision"], created["revision"]);
+    let updated = server.execute("sidequery.notebook.sql.source.write", serde_json::json!({
+        "notebook_path":"mcp.sqlnb", "source":"select 2", "expected_revision":created["revision"]
+    }), tokio_util::sync::CancellationToken::new()).await.unwrap();
+    assert_ne!(updated["revision"], created["revision"]);
+    assert!(server.execute("sidequery.notebook.sql.source.write", serde_json::json!({
+        "notebook_path":"mcp.sqlnb", "source":"select 3", "expected_revision":created["revision"]
+    }), tokio_util::sync::CancellationToken::new()).await.unwrap_err().contains("changed"));
+    assert!(server
+        .execute(
+            "sidequery.notebook.sql.source.read",
+            serde_json::json!({"notebook_path":"../escape.sqlnb"}),
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn mcp_contract_rejects_legacy_names_invalid_arguments_and_ambiguous_targets() {
+    let fixture = Fixture::new();
+    let server = mcp::McpServer(fixture.state.clone());
+    for name in [
+        "query",
+        "inspect_schema",
+        "list_notebooks",
+        "read_notebook",
+        "write_notebook",
+        "list_live_notebooks",
+        "execute_live_notebook",
+    ] {
+        assert!(server
+            .execute(
+                name,
+                serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap_err()
+            .starts_with("NOT_FOUND:"));
+    }
+    for (name, args) in [
+        (
+            "sidequery.sql.query",
+            serde_json::json!({"sql":"select 1", "limit":0}),
+        ),
+        (
+            "sidequery.sql.execute",
+            serde_json::json!({"sql":"select 1", "limit":2,"max_rows":3}),
+        ),
+        (
+            "sidequery.notebook.sql.cell.update",
+            serde_json::json!({"sql":"select 1", "cell_index":0}),
+        ),
+        (
+            "sidequery.notebook.sql.cell.insert",
+            serde_json::json!({"sql":"select 1", "expected_revision":"r1", "position":0}),
+        ),
+    ] {
+        assert!(server
+            .execute(name, args, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err()
+            .starts_with("INVALID_ARGUMENT:"));
+    }
+    let mut state = fixture.state.clone();
+    state.mcp_token = "agent-capability".into();
+    let app = router(state.clone());
+    let incompatible = app.clone().oneshot(fixture.request("POST", "/api/v1/mcp/browser/poll", Some(serde_json::json!({"session_id":"old-browser","notebook_path":"same.sqlnb","revision":"r1"})))).await.unwrap();
+    assert_eq!(incompatible.status(), StatusCode::CONFLICT);
+    for session in ["first", "second"] {
+        let response = app.clone().oneshot(fixture.request("POST", "/api/v1/mcp/browser/poll", Some(serde_json::json!({"contract_version":2,"session_id":session,"notebook_path":"same.sqlnb","revision":"r1"})))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let server = mcp::McpServer(state);
+    assert!(server
+        .execute(
+            "sidequery.notebook.sql.get",
+            serde_json::json!({"notebook_path":"same.sqlnb"}),
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .unwrap_err()
+        .starts_with("CONFLICT:"));
+    let task = tokio::spawn(async move {
+        server.execute("sidequery.notebook.sql.cell.update", serde_json::json!({"session_id":"first","notebook_path":"same.sqlnb","expected_revision":"r1","cell_index":0,"sql":"select 42","title":"Revenue","run":"none"}), tokio_util::sync::CancellationToken::new()).await
+    });
+    tokio::task::yield_now().await;
+    let response = json_body(app.clone().oneshot(fixture.request("POST", "/api/v1/mcp/browser/poll", Some(serde_json::json!({"contract_version":2,"session_id":"first","notebook_path":"same.sqlnb","revision":"r1"})))).await.unwrap()).await;
+    let command = &response["commands"][0];
+    assert_eq!(command["contract_version"], 2);
+    assert_eq!(command["operation"], "cell.update");
+    assert_eq!(
+        command["arguments"],
+        serde_json::json!({"cell_index":0,"sql":"select 42","title":"Revenue","run":"none"})
+    );
+    assert_eq!(command["expected_revision"], "r1");
+    let acknowledgment = serde_json::json!({"ok":true,"kind":"notebook","operation":"cell.update","cells":[],"mutation":{"saved":false},"revision":"r2"});
+    let response = app.oneshot(fixture.request("POST", "/api/v1/mcp/browser/result", Some(serde_json::json!({"session_id":"first","request_id":command["request_id"],"result":acknowledgment})))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(task.await.unwrap().unwrap(), acknowledgment);
 }

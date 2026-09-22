@@ -8,10 +8,22 @@
 #include "sidequery_http.h"
 
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
 #if __has_include("duckdb/main/extension_repository_manager.hpp")
@@ -22,6 +34,8 @@
 #include <openssl/rand.h>
 
 #include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -170,10 +184,312 @@ static void StopQuack(DatabaseInstance &database, const string &listen_uri) {
   }
 }
 
+// The owner connection's cleanup hook releases this connection, avoiding a
+// database -> extension state -> agent connection -> database reference cycle.
+class McpConnection {
+public:
+  explicit McpConnection(DatabaseInstance &database) : connection(database) {}
+
+  static char *Query(void *context, uint64_t id, const char *sql, uint64_t max_rows,
+                     uint64_t max_bytes, bool read_only) noexcept {
+    auto &self = *static_cast<McpConnection *>(context);
+    std::lock_guard<std::mutex> serial(self.query_lock);
+    {
+      std::lock_guard<std::mutex> guard(self.active_lock);
+      self.active_id = id;
+      self.cancelled = false;
+    }
+    string response;
+    try {
+      response = self.Execute(sql, max_rows, max_bytes, read_only);
+    } catch (const std::exception &error) {
+      string message = error.what();
+      auto policy = message.find("POLICY_BLOCKED:");
+      if (policy != string::npos) {
+        // DuckDB prefixes InvalidInputException messages with its error class.
+        // Preserve the MCP contract's stable code at the response boundary.
+        message = message.substr(policy);
+      }
+      response = "{\"error\":" + JSONEscape(message) + "}";
+    } catch (...) {
+      response = "{\"error\":\"unexpected DuckDB query failure\"}";
+    }
+    {
+      std::lock_guard<std::mutex> guard(self.active_lock);
+      if (self.cancelled) {
+        response = "{\"error\":\"query cancelled\"}";
+      }
+      self.active_id = 0;
+    }
+    auto result = static_cast<char *>(std::malloc(response.size() + 1));
+    if (result) {
+      std::memcpy(result, response.c_str(), response.size() + 1);
+    }
+    return result;
+  }
+
+  static void Interrupt(void *context, uint64_t id) noexcept {
+    auto &self = *static_cast<McpConnection *>(context);
+    std::lock_guard<std::mutex> guard(self.active_lock);
+    if (id != 0 && self.active_id == id) {
+      self.cancelled = true;
+      self.connection.Interrupt();
+    }
+  }
+
+  static void Free(char *result) { std::free(result); }
+
+private:
+  static string JSONValue(const Value &value) {
+    if (value.IsNull()) {
+      return "null";
+    }
+    switch (value.type().id()) {
+    case LogicalTypeId::BOOLEAN:
+      return value.GetValue<bool>() ? "true" : "false";
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+      return value.ToString();
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+      if (std::isfinite(value.GetValue<double>())) {
+        return value.ToString();
+      }
+      break;
+    default:
+      break;
+    }
+    // Preserve BIGINT, DECIMAL, dates and nested values without JSON precision loss.
+    return JSONEscape(value.ToString());
+  }
+
+  static bool StateChangingFunction(const string &name) {
+    static const unordered_set<string> blocked = {
+        "nextval", "setval", "write_csv", "write_json", "write_parquet", "checkpoint",
+        "force_checkpoint", "query", "query_table", "http_post", "http_put", "http_delete"};
+    return blocked.count(name) || StringUtil::StartsWith(name, "quack_") ||
+           StringUtil::StartsWith(name, "sqlnb_") || StringUtil::StartsWith(name, "sidequery_ui_");
+  }
+
+  void CheckReadOnlyExpression(ParsedExpression &expression) {
+    if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+      auto &function = expression.Cast<FunctionExpression>();
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+#else
+      auto name = StringUtil::Lower(function.function_name);
+#endif
+      // User macros can hide functions that perform work while binding, before
+      // DuckDB has produced the statement properties or logical plan to audit.
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      auto entry = Catalog::GetEntry(*connection.context,
+          EntryLookupInfo(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName()),
+          OnEntryNotFound::RETURN_NULL);
+#else
+      auto entry = Catalog::GetEntry(*connection.context, CatalogType::SCALAR_FUNCTION_ENTRY,
+          function.catalog, function.schema, function.function_name, OnEntryNotFound::RETURN_NULL);
+#endif
+      if (entry && entry->type == CatalogType::MACRO_ENTRY && !entry->internal) {
+        throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query cannot verify user-defined macros before binding; use sidequery.sql.execute");
+      }
+      if (StateChangingFunction(name)) {
+        throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query rejects state-changing function '%s'; use sidequery.sql.execute", name);
+      }
+    }
+    if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+      auto &subquery = expression.Cast<SubqueryExpression>();
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      CheckReadOnlyNode(*subquery.SubqueryMutable()->node);
+#else
+      CheckReadOnlyNode(*subquery.subquery->node);
+#endif
+    }
+    ParsedExpressionIterator::EnumerateChildren(expression, [this](ParsedExpression &child) {
+      CheckReadOnlyExpression(child);
+    });
+  }
+
+  void CheckReadOnlyNode(QueryNode &node) {
+    ParsedExpressionIterator::EnumerateQueryNodeChildren(node, [this](unique_ptr<ParsedExpression> &expression) {
+      CheckReadOnlyExpression(*expression);
+    }, [this](TableRef &reference) {
+      if (reference.type == TableReferenceType::BASE_TABLE) {
+        auto &table = reference.Cast<BaseTableRef>();
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+        auto entry = Catalog::GetEntry(*connection.context,
+            EntryLookupInfo(CatalogType::TABLE_ENTRY, table.GetQualifiedName()),
+            OnEntryNotFound::RETURN_NULL);
+#else
+        auto entry = Catalog::GetEntry(*connection.context, CatalogType::TABLE_ENTRY,
+            table.catalog_name, table.schema_name, table.table_name, OnEntryNotFound::RETURN_NULL);
+#endif
+        if (entry && entry->type == CatalogType::VIEW_ENTRY && !entry->internal) {
+          throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query cannot verify user-defined views before binding; use sidequery.sql.execute");
+        }
+      }
+      if (reference.type == TableReferenceType::TABLE_FUNCTION) {
+        auto &table = reference.Cast<TableFunctionRef>();
+        auto &function = table.function->Cast<FunctionExpression>();
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+        auto entry = Catalog::GetEntry(*connection.context,
+            EntryLookupInfo(CatalogType::TABLE_FUNCTION_ENTRY, function.GetQualifiedName()),
+            OnEntryNotFound::RETURN_NULL);
+        CheckReadOnlyScan(StringUtil::Lower(function.FunctionName().GetIdentifierName()));
+#else
+        auto entry = Catalog::GetEntry(*connection.context, CatalogType::TABLE_FUNCTION_ENTRY,
+            function.catalog, function.schema, function.function_name, OnEntryNotFound::RETURN_NULL);
+        CheckReadOnlyScan(StringUtil::Lower(function.function_name));
+#endif
+        if (entry && entry->type == CatalogType::TABLE_MACRO_ENTRY && !entry->internal) {
+          throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query cannot verify user-defined macros before binding; use sidequery.sql.execute");
+        }
+        if (table.subquery) {
+          CheckReadOnlyNode(*table.subquery->node);
+        }
+      }
+    });
+  }
+
+  static void CheckReadOnlyScan(const string &name) {
+    static const unordered_set<string> read_scans = {
+        "seq_scan", "table_scan", "range", "generate_series", "unnest", "repeat",
+        "read_csv", "read_csv_auto", "csv_scan", "read_parquet", "parquet_scan",
+        "read_json", "read_json_auto", "read_ndjson", "read_ndjson_auto", "json_scan",
+        "read_json_objects", "read_json_objects_auto", "read_ndjson_objects", "glob"};
+    if (!read_scans.count(name) && !StringUtil::StartsWith(name, "duckdb_") &&
+        !StringUtil::StartsWith(name, "pragma_")) {
+      throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query cannot verify read-only table function '%s'; use sidequery.sql.execute", name);
+    }
+  }
+
+  static void CheckReadOnlyPlan(LogicalOperator &plan) {
+    // Database modification properties do not describe external table-function
+    // effects. Fail closed for scans whose read-only behavior is not known.
+    if (plan.type == LogicalOperatorType::LOGICAL_GET) {
+      auto &scan = plan.Cast<LogicalGet>();
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      auto name = StringUtil::Lower(scan.function.GetName().GetIdentifierName());
+#else
+      auto name = StringUtil::Lower(scan.function.name);
+#endif
+      CheckReadOnlyScan(name);
+    }
+    LogicalOperatorVisitor::EnumerateExpressions(plan, [](unique_ptr<Expression> *expression) {
+      if ((*expression)->IsVolatile()) {
+        throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query rejects volatile functions; use sidequery.sql.execute");
+      }
+    });
+    for (auto &child : plan.children) {
+      CheckReadOnlyPlan(*child);
+    }
+  }
+
+  string Execute(const char *sql, uint64_t max_rows, uint64_t max_bytes, bool read_only) {
+    max_rows = std::min<uint64_t>(max_rows, 10000);
+    max_bytes = std::min<uint64_t>(max_bytes, 4 * 1024 * 1024);
+    auto statements = connection.ExtractStatements(sql);
+    if (statements.size() != 1) {
+      throw InvalidInputException("MCP SQL tools require exactly one SQL statement");
+    }
+    unique_ptr<PreparedStatement> prepared;
+    unique_ptr<QueryResult> result;
+    if (read_only) {
+      if (statements[0]->type != StatementType::SELECT_STATEMENT) {
+        throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query requires a read-only SELECT; use sidequery.sql.execute");
+      }
+      connection.context->RunFunctionInTransaction([&]() {
+        CheckReadOnlyNode(*statements[0]->Cast<SelectStatement>().node);
+      });
+      prepared = connection.Prepare(std::move(statements[0]));
+      if (prepared->HasError()) {
+        throw InvalidInputException("%s", prepared->GetError());
+      }
+      if (!prepared->GetStatementProperties().modified_databases.empty()) {
+        throw InvalidInputException("POLICY_BLOCKED: sidequery.sql.query rejects database mutations; use sidequery.sql.execute");
+      }
+      auto plan = connection.ExtractPlan(sql);
+      CheckReadOnlyPlan(*plan);
+      result = prepared->Execute();
+    } else {
+      result = connection.SendQuery(std::move(statements[0]));
+    }
+    if (!result || result->HasError()) {
+      throw IOException("%s", result ? result->GetError() : "query returned no result");
+    }
+    string response = "{\"columns\":[";
+    string types = "],\"types\":[";
+    vector<string> names;
+    unordered_set<string> used_names;
+    for (idx_t column = 0; column < result->ColumnCount(); column++) {
+#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
+      auto original_name = result->ColumnName(column).GetIdentifierName();
+      auto type = result->GetTypes()[column];
+#else
+      auto original_name = result->names[column];
+      auto type = result->types[column];
+#endif
+      auto name = original_name;
+      auto suffix = 1;
+      while (!used_names.insert(name).second) {
+        name = original_name + "_" + std::to_string(suffix++);
+      }
+      names.push_back(name);
+      response += (column ? "," : "") + JSONEscape(name);
+      types += (column ? "," : "") + JSONEscape(type.ToString());
+    }
+    response += types + "],\"rows\":[";
+    if (response.size() + 128 > max_bytes) {
+      throw InvalidInputException("query column metadata exceeds result byte limit");
+    }
+    uint64_t count = 0;
+    bool truncated = false;
+    while (auto chunk = result->Fetch()) {
+      for (idx_t row = 0; row < chunk->size(); row++) {
+        if (count >= max_rows) {
+          truncated = true;
+          break;
+        }
+        string object = "{";
+        for (idx_t column = 0; column < names.size(); column++) {
+          object += (column ? "," : "") + JSONEscape(names[column]) + ":" +
+                    JSONValue(chunk->GetValue(column, row));
+          if (response.size() + object.size() + 128 > max_bytes) {
+            truncated = true;
+            break;
+          }
+        }
+        if (truncated) {
+          break;
+        }
+        response += (count ? "," : "") + object + "}";
+        count++;
+      }
+      if (truncated) {
+        break;
+      }
+    }
+    if (result->HasError()) {
+      throw IOException("%s", result->GetError());
+    }
+    return response + "],\"returned_rows\":" + std::to_string(count) +
+           ",\"truncated\":" + (truncated ? "true}" : "false}");
+  }
+
+  Connection connection;
+  std::mutex query_lock;
+  std::mutex active_lock;
+  uint64_t active_id = 0;
+  bool cancelled = false;
+};
+
 class SqlnbServer {
 public:
   SqlnbServer(shared_ptr<DatabaseInstance> database_p, const string &remote_url,
-              const string &local_dir, int requested_port, const string &notebook_root)
+              const string &local_dir, int requested_port, const string &notebook_root, bool mcp)
       : database(database_p), quack(StartQuack(*database_p)) {
     if (local_dir.empty() && remote_url.empty()) {
       StopQuack(*database_p, quack.listen_uri);
@@ -184,15 +500,22 @@ public:
       quack_url.push_back('/');
     }
     quack_url += "quack";
+    if (mcp) {
+      mcp_token = RandomHex(32);
+      mcp_connection = make_uniq<McpConnection>(*database_p);
+    }
     auto config = "{\"port\":" + std::to_string(requested_port) +
                   ",\"localAssetDirectory\":" + JSONEscape(local_dir) +
                   ",\"remoteAssetUrl\":" + JSONEscape(remote_url) +
                   ",\"quackUrl\":" + JSONEscape(quack_url) +
                   ",\"token\":" + JSONEscape(quack.token) +
                   ",\"duckdbVersion\":" + JSONEscape(DuckDB::LibraryVersion()) +
-                  ",\"notebookRoot\":" + JSONEscape(notebook_root) + "}";
+                  ",\"notebookRoot\":" + JSONEscape(notebook_root) +
+                  ",\"mcpToken\":" + JSONEscape(mcp_token) + "}";
     char *error = nullptr;
-    http_server = sidequery_http_start(config.c_str(), &error);
+    http_server = sidequery_http_start_with_query(config.c_str(), mcp_connection.get(),
+                                                  McpConnection::Query, McpConnection::Interrupt,
+                                                  McpConnection::Free, &error);
     if (!http_server) {
       string message = error ? error : "unknown error";
       if (error) {
@@ -220,12 +543,18 @@ public:
 
   string LaunchURL() const { return origin + "/#sidequery_token=" + quack.token; }
   string Origin() const { return origin; }
+  string McpStatus() const {
+    return mcp_token.empty() ? "{\"enabled\":false}"
+                            : "{\"enabled\":true,\"url\":" + JSONEscape(origin + "/mcp") +
+                                  ",\"token\":" + JSONEscape(mcp_token) + "}";
+  }
 
   void Stop() {
     if (http_server) {
       sidequery_http_stop(http_server);
       http_server = nullptr;
     }
+    mcp_connection.reset();
     if (!quack.listen_uri.empty()) {
       auto listen_uri = std::move(quack.listen_uri);
       auto owner = database.lock();
@@ -240,18 +569,20 @@ private:
   QuackEndpoint quack;
   void *http_server = nullptr;
   string origin;
+  string mcp_token;
+  unique_ptr<McpConnection> mcp_connection;
 };
 
 class SqlnbState : public StorageExtensionInfo {
 public:
   string Start(shared_ptr<DatabaseInstance> database, const string &remote_url, const string &local_dir,
-               int port, bool open_browser, const string &notebook_root, connection_t caller) {
+               int port, bool open_browser, const string &notebook_root, bool mcp, connection_t caller) {
     std::lock_guard<std::mutex> guard(lock);
     if (server) {
       throw InvalidInputException("SQLNB is already running");
     }
     auto candidate = make_uniq<SqlnbServer>(std::move(database), remote_url, local_dir, port,
-                                            notebook_root);
+                                            notebook_root, mcp);
     auto launch_url = candidate->LaunchURL();
     if (open_browser) {
       OpenBrowser(launch_url);
@@ -296,7 +627,8 @@ private:
   string StatusJSON(const string &launch_url) const {
     return "{\"running\":true,\"bridgeVersion\":1,\"protocol\":\"quack\","
            "\"engine\":\"native-duckdb\",\"baseUrl\":" +
-           JSONEscape(server->Origin()) + ",\"launchUrl\":" + JSONEscape(launch_url) + "}";
+           JSONEscape(server->Origin()) + ",\"launchUrl\":" + JSONEscape(launch_url) +
+           ",\"mcp\":" + server->McpStatus() + "}";
   }
 
   static void OpenBrowser(const string &url) {
@@ -340,6 +672,20 @@ static SqlnbState &GetState(DatabaseInstance &database) {
   return *static_cast<SqlnbState *>(extension->storage_info.get());
 }
 
+class McpOwnerCleanup : public ClientContextState {
+public:
+  McpOwnerCleanup(SqlnbState &state_p, connection_t owner_p) : state(state_p), owner(owner_p) {}
+  ~McpOwnerCleanup() override {
+    try {
+      state.Stop(owner);
+    } catch (...) {
+    }
+  }
+private:
+  SqlnbState &state;
+  connection_t owner;
+};
+
 static void StartFunction(DataChunk &args, ExpressionState &state, Vector &result) {
   if (!args.AllConstant()) {
     throw InvalidInputException("sqlnb_start arguments must be constant");
@@ -355,6 +701,7 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   auto port = args.ColumnCount() > 2 ? args.data[2].GetValue(0).GetValue<int32_t>() : 0;
   auto open_browser = args.ColumnCount() > 3 ? args.data[3].GetValue(0).GetValue<bool>() : true;
   auto notebook_root = args.ColumnCount() > 4 ? args.data[4].GetValue(0).GetValue<string>() : string();
+  auto mcp = args.ColumnCount() > 5 ? args.data[5].GetValue(0).GetValue<bool>() : false;
   if (port < 0 || port > 65535) {
     throw InvalidInputException("port must be between 0 and 65535");
   }
@@ -363,8 +710,12 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   }
   auto &database = *state.GetContext().db;
   result.SetValue(0, Value(GetState(database).Start(state.GetContext().db, remote_url, local_dir, port,
-                                                    open_browser, notebook_root,
+                                                    open_browser, notebook_root, mcp,
                                                     state.GetContext().GetConnectionId())));
+  if (mcp) {
+    state.GetContext().registered_state->GetOrCreate<McpOwnerCleanup>(
+        "sqlnb_mcp_owner", GetState(database), state.GetContext().GetConnectionId());
+  }
   result.SetVectorType(VectorType::CONSTANT_VECTOR);
 }
 
@@ -391,7 +742,8 @@ static void LoadInternal(ExtensionLoader &loader) {
        FunctionParameter("assets", LogicalType::VARCHAR, Value("")),
        FunctionParameter("port", LogicalType::INTEGER, Value::INTEGER(0)),
        FunctionParameter("open_browser", LogicalType::BOOLEAN, Value::BOOLEAN(true)),
-       FunctionParameter("notebook_root", LogicalType::VARCHAR, Value(""))},
+       FunctionParameter("notebook_root", LogicalType::VARCHAR, Value("")),
+       FunctionParameter("mcp", LogicalType::BOOLEAN, Value::BOOLEAN(false))},
       LogicalType::VARCHAR);
   ScalarFunction sqlnb_start("sqlnb_start", std::move(sqlnb_start_signature), StartFunction);
   sqlnb_start.SetVolatile();
@@ -417,6 +769,12 @@ static void LoadInternal(ExtensionLoader &loader) {
   start_five.SetVolatile();
   start_five.SetFallible();
   compatibility_starts.AddFunction(start_five);
+  ScalarFunction start_six({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+                            LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                           LogicalType::VARCHAR, StartFunction);
+  start_six.SetVolatile();
+  start_six.SetFallible();
+  compatibility_starts.AddFunction(start_six);
   loader.RegisterFunction(compatibility_starts);
 
   ScalarFunction status("sqlnb_status", {}, LogicalType::VARCHAR, StatusFunction);

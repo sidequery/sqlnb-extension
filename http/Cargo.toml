@@ -24,6 +24,8 @@ tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "time"
 tower = { version = "0.5", features = ["util"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

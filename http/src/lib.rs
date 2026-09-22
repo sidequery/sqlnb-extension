@@ -13,6 +13,7 @@ use axum::{
 use bytes::Bytes;
 mod cache_location;
 mod history;
+mod mcp;
 mod project_git;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,6 +63,8 @@ struct ServerConfig {
     duckdb_version: String,
     #[serde(default)]
     notebook_root: String,
+    #[serde(default)]
+    mcp_token: String,
 }
 
 #[derive(Clone)]
@@ -74,6 +77,10 @@ struct AppState {
     client: reqwest::Client,
     assets: Arc<ResolvedAssets>,
     notebooks: Arc<NotebookStore>,
+    mcp_token: String,
+    mcp_broker: Arc<mcp::Broker>,
+    mcp_query: Option<mcp::QueryBridge>,
+    mcp_shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug)]
@@ -233,6 +240,7 @@ struct BootstrapResponse {
     supports_cancel: bool,
     engine: &'static str,
     duckdb_version: String,
+    mcp_bridge: bool,
 }
 
 #[derive(Serialize)]
@@ -347,6 +355,10 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         client,
         assets: Arc::new(assets),
         notebooks: Arc::new(notebooks),
+        mcp_token: config.mcp_token,
+        mcp_broker: Arc::new(mcp::Broker::default()),
+        mcp_query: None,
+        mcp_shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }
 
@@ -1886,6 +1898,16 @@ async fn security_middleware(
         )
         .into_response();
     }
+    if request.uri().path() == "/mcp" || request.uri().path().starts_with("/mcp/") {
+        let mut mcp_state = state.clone();
+        mcp_state.token = state.mcp_token.clone();
+        if state.mcp_token.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if let Err(error) = authenticate(request.headers(), &mcp_state) {
+            return error.into_response();
+        }
+    }
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1958,6 +1980,7 @@ async fn bootstrap(
             supports_cancel: false,
             engine: "native-duckdb",
             duckdb_version: state.duckdb_version.clone(),
+            mcp_bridge: !state.mcp_token.is_empty(),
         }),
     ))
 }
@@ -2476,7 +2499,7 @@ async fn static_asset(
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/files", get(list_files))
         .route("/api/v1/git", get(git_status))
@@ -2500,7 +2523,31 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/file", get(get_file).put(put_file))
         .route("/api/v1/file/move", post(move_file))
         .route("/api/v1/folder", post(create_folder))
-        .route("/quack", post(quack).options(options_quack))
+        .route("/quack", post(quack).options(options_quack));
+    if !state.mcp_token.is_empty() {
+        use rmcp::transport::streamable_http_server::{
+            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        };
+        let service_state = state.clone();
+        let mut config = StreamableHttpServerConfig::default();
+        config.cancellation_token = state.mcp_shutdown.clone();
+        config.allowed_hosts = vec![
+            format!("127.0.0.1:{}", state.port),
+            format!("localhost:{}", state.port),
+        ];
+        config.allowed_origins = vec![state.origin.clone()];
+        let service = StreamableHttpService::new(
+            move || Ok(mcp::McpServer(service_state.clone())),
+            Arc::new(LocalSessionManager::default()),
+            config,
+        );
+        router = router
+            .nest_service("/mcp", service)
+            .route("/api/v1/mcp/browser/poll", post(mcp::poll))
+            .route("/api/v1/mcp/browser/result", post(mcp::browser_result))
+            .route("/api/v1/mcp/browser/disconnect", post(mcp::disconnect));
+    }
+    router
         .fallback(get(static_asset))
         .layer(DefaultBodyLimit::max(MAX_QUACK_MESSAGE_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -2511,6 +2558,13 @@ fn router(state: AppState) -> Router {
 }
 
 fn start(config: ServerConfig) -> Result<ServerHandle, String> {
+    start_with_query(config, None)
+}
+
+fn start_with_query(
+    config: ServerConfig,
+    query: Option<mcp::QueryBridge>,
+) -> Result<ServerHandle, String> {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("failed to bind SQLNB to 127.0.0.1: {error}"))?;
@@ -2521,7 +2575,9 @@ fn start(config: ServerConfig) -> Result<ServerHandle, String> {
         .local_addr()
         .map_err(|error| format!("failed to inspect SQLNB listener: {error}"))?
         .port();
-    let state = build_state(config, port)?;
+    let mut state = build_state(config, port)?;
+    state.mcp_query = query;
+    let mcp_shutdown = state.mcp_shutdown.clone();
     let notebooks = state.notebooks.clone();
     let app = router(state);
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -2571,6 +2627,7 @@ fn start(config: ServerConfig) -> Result<ServerHandle, String> {
                 let mut graceful_rx = shutdown_rx;
                 let wait_for_shutdown = async move {
                     while !*graceful_rx.borrow() && graceful_rx.changed().await.is_ok() {}
+                    mcp_shutdown.cancel();
                 };
                 let _ = axum::serve(listener, app)
                     .with_graceful_shutdown(wait_for_shutdown)
@@ -2606,6 +2663,51 @@ fn set_error(error_out: *mut *mut c_char, message: String) {
     let value = CString::new(sanitized).expect("sanitized string contains no NUL");
     unsafe {
         *error_out = value.into_raw();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sidequery_http_start_with_query(
+    config_json: *const c_char,
+    context: *mut c_void,
+    query: mcp::QueryCallback,
+    interrupt: mcp::InterruptCallback,
+    free: mcp::FreeCallback,
+    error_out: *mut *mut c_char,
+) -> *mut c_void {
+    let result = std::panic::catch_unwind(|| -> Result<ServerHandle, String> {
+        if config_json.is_null() {
+            return Err("config_json must not be null".into());
+        }
+        let config = unsafe { CStr::from_ptr(config_json) }
+            .to_str()
+            .map_err(|_| "config_json must be UTF-8".to_string())?;
+        let config = serde_json::from_str(config)
+            .map_err(|error| format!("invalid server config: {error}"))?;
+        start_with_query(
+            config,
+            Some(mcp::QueryBridge {
+                context: context as usize,
+                query,
+                interrupt,
+                free,
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+            }),
+        )
+    });
+    match result {
+        Ok(Ok(handle)) => Box::into_raw(Box::new(handle)).cast(),
+        Ok(Err(error)) => {
+            set_error(error_out, error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_error(
+                error_out,
+                "unexpected panic while starting SQLNB MCP server".into(),
+            );
+            ptr::null_mut()
+        }
     }
 }
 
