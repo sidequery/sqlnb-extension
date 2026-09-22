@@ -1,5 +1,8 @@
 //! Optional local MCP surface. Its capability is deliberately distinct from the UI capability.
 use super::*;
+#[path = "mcp_contract.rs"]
+mod contract;
+use contract::{definitions, Operation};
 use rmcp::{model::*, service::RequestContext, ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -8,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 pub type QueryCallback =
-    unsafe extern "C" fn(*mut c_void, u64, *const c_char, u64, u64) -> *mut c_char;
+    unsafe extern "C" fn(*mut c_void, u64, *const c_char, u64, u64, bool) -> *mut c_char;
 pub type InterruptCallback = unsafe extern "C" fn(*mut c_void, u64);
 pub type FreeCallback = unsafe extern "C" fn(*mut c_char);
 #[derive(Clone)]
@@ -25,6 +28,7 @@ impl QueryBridge {
         &self,
         sql: String,
         rows: u64,
+        read_only: bool,
         ct: CancellationToken,
     ) -> Result<Value, String> {
         let guard = tokio::select! {
@@ -62,6 +66,7 @@ impl QueryBridge {
                     sql.as_ptr(),
                     rows,
                     1024 * 1024,
+                    read_only,
                 )
             };
             done.store(true, Ordering::Release);
@@ -123,6 +128,7 @@ struct BrowserSession {
 }
 #[derive(Deserialize)]
 pub struct Poll {
+    contract_version: Option<u32>,
     session_id: String,
     notebook_path: Option<String>,
     revision: String,
@@ -174,6 +180,7 @@ impl Broker {
         let operation = string(args, "operation")?;
         if ![
             "notebook.get",
+            "cell.list",
             "notebook.run",
             "cell.insert",
             "cell.update",
@@ -192,13 +199,19 @@ impl Broker {
             let session = sessions
                 .get_mut(session_id)
                 .ok_or("browser session disconnected")?;
+            if args
+                .get("notebook_path")
+                .is_some_and(|path| *path != json!(session.path))
+            {
+                return Err("CONFLICT: notebook target changed".into());
+            }
             if session.revision != revision {
                 return Err("notebook revision changed; read live sessions again".into());
             }
             if !session.pending.is_empty() {
                 return Err("browser session already has a pending command".into());
             }
-            session.queue.push_back(json!({"request_id":id,"session_id":session_id,"notebook_path":session.path,"expected_revision":revision,"operation":operation,"arguments":args.get("arguments").cloned().unwrap_or(json!({}))}));
+            session.queue.push_back(json!({"contract_version":2,"request_id":id,"session_id":session_id,"notebook_path":session.path,"expected_revision":revision,"operation":operation,"arguments":args.get("arguments").cloned().unwrap_or(json!({}))}));
             session.pending.insert(id.clone(), tx);
         }
         let _pending = PendingCommand {
@@ -220,6 +233,11 @@ pub async fn poll(
     Json(body): Json<Poll>,
 ) -> Result<Json<Value>, ApiError> {
     bridge_auth(&headers, &state)?;
+    if body.contract_version != Some(2) {
+        return Err(unavailable(
+            "Incompatible notebook MCP bridge; update the native extension and browser UI together",
+        ));
+    }
     if body.session_id.is_empty() || body.session_id.len() > 128 || body.revision.len() > 256 {
         return Err(unavailable("invalid session identity"));
     }
@@ -286,70 +304,6 @@ fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{key} must be a string"))
 }
-fn definitions() -> Vec<Tool> {
-    let text = json!({"type": "string"});
-    let nullable_text = json!({"type": ["string", "null"]});
-    let definition = |name, description, properties: Value, required: Value| {
-        let schema = json!({
-            "type": "object", "properties": properties,
-            "required": required, "additionalProperties": false,
-        });
-        Tool::new(name, description, schema.as_object().unwrap().clone())
-    };
-    vec![
-        definition(
-            "query",
-            "Execute one SQL statement on a persistent agent connection in the running DuckDB database. Separate from browser temporary tables and transactions. SQL may modify data. Results bounded to 1000 rows and 1 MiB; timeout 30 seconds.",
-            json!({"sql": text, "max_rows": {"type": "integer", "minimum": 1, "maximum": 1000}}),
-            json!(["sql"]),
-        ),
-        definition(
-            "inspect_schema", "List database schema columns visible to the agent connection.",
-            json!({}), json!([]),
-        ),
-        definition(
-            "list_notebooks", "List saved SQL notebooks beneath the configured root.",
-            json!({}), json!([]),
-        ),
-        definition(
-            "read_notebook",
-            "Read saved notebook source and revision. For unsaved browser state use live notebook tools.",
-            json!({"notebook_path": text}), json!(["notebook_path"]),
-        ),
-        definition(
-            "write_notebook",
-            "Write saved notebook source using an expected revision. Empty revision creates a new notebook. Rejects paths reported open by connected browsers at request time; use the live bridge for those documents.",
-            json!({"notebook_path": text, "source": text, "expected_revision": text}),
-            json!(["notebook_path", "source", "expected_revision"]),
-        ),
-        definition(
-            "list_live_notebooks",
-            "List connected browser session identities, paths, and current document revisions.",
-            json!({}), json!([]),
-        ),
-        definition(
-            "execute_live_notebook",
-            "Read, edit or run the exact open notebook session at the expected revision. Edits apply to the unsaved live document. Browser running queries cannot currently be interrupted; cancellation stops subsequent cells. Cell indices and insertion positions are zero-based. Get run defaults to none; editing run defaults to none.",
-            json!({
-                "session_id": text, "expected_revision": text,
-                "operation": {"enum": ["notebook.get", "notebook.run", "cell.insert", "cell.update", "cell.delete", "cell.run"]},
-                "arguments": {
-                    "type": "object",
-                    "properties": {
-                        "cell_id": text,
-                        "cell_index": {"type": "integer", "minimum": 0},
-                        "position": {"type": "integer", "minimum": 0},
-                        "sql": text, "title": nullable_text, "connection": nullable_text,
-                        "display_title": nullable_text, "markdown": nullable_text,
-                        "run": {"enum": ["none", "missing", "all", "cell", "affected"]},
-                    },
-                    "additionalProperties": false,
-                },
-            }),
-            json!(["session_id", "expected_revision", "operation"]),
-        ),
-    ]
-}
 impl McpServer {
     pub(super) async fn execute(
         &self,
@@ -357,80 +311,113 @@ impl McpServer {
         args: Value,
         ct: CancellationToken,
     ) -> Result<Value, String> {
-        match name {
-            "query" | "inspect_schema" => {
-                let sql = if name == "inspect_schema" {
+        let definition = definitions()
+            .into_iter()
+            .find(|d| d.tool.name == name)
+            .ok_or("NOT_FOUND: unknown tool")?;
+        contract::validate(&definition.tool, &args)?;
+        match definition.operation {
+            Operation::Query { .. } | Operation::Schema => {
+                let read_only =
+                    !matches!(definition.operation, Operation::Query { read_only: false });
+                let sql = if matches!(definition.operation, Operation::Schema) {
                     "select table_catalog,table_schema,table_name,column_name,data_type,ordinal_position from information_schema.columns order by 1,2,3,6".into()
                 } else {
                     string(&args, "sql")?.to_string()
                 };
                 if sql.len() > 1024 * 1024 {
-                    return Err("SQL exceeds 1 MiB".into());
+                    return Err("INVALID_ARGUMENT: SQL exceeds 1 MiB".into());
+                }
+                if args.get("limit").is_some()
+                    && args.get("max_rows").is_some()
+                    && args["limit"] != args["max_rows"]
+                {
+                    return Err("INVALID_ARGUMENT: limit and max_rows disagree".into());
                 }
                 let rows = args
-                    .get("max_rows")
-                    .map(|v| {
-                        v.as_u64()
-                            .filter(|n| (1..=1000).contains(n))
-                            .ok_or("max_rows must be between 1 and 1000")
-                    })
-                    .transpose()?
-                    .unwrap_or(1000);
+                    .get("limit")
+                    .or_else(|| args.get("max_rows"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100);
                 let query = self
                     .0
                     .mcp_query
                     .as_ref()
                     .ok_or("native query bridge unavailable")?;
-                tokio::select! {
-                    result = query.execute(sql, rows, ct) => result,
-                    _ = self.0.mcp_shutdown.cancelled() => Err("server stopping".into()),
+                let mut value = tokio::select! {
+                    result = query.execute(sql, rows, read_only, ct) => result?,
+                    _ = self.0.mcp_shutdown.cancelled() => return Err("server stopping".into()),
+                };
+                value["ok"] = json!(true);
+                if let Some(rows) = value.get("rows").and_then(Value::as_array) {
+                    value["rowCount"] = json!(rows.len());
                 }
+                Ok(value)
             }
-            "list_live_notebooks" => Ok(json!({"sessions": self.0.mcp_broker.list()})),
-            "execute_live_notebook" => self.0.mcp_broker.dispatch(&args, ct).await,
-            "list_notebooks" | "read_notebook" | "write_notebook" => {
+            Operation::Live(operation) => {
+                let sessions = self.0.mcp_broker.list();
+                let candidates: Vec<_> = sessions
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|session| {
+                        args.get("session_id")
+                            .is_none_or(|id| *id == session["session_id"])
+                            && args
+                                .get("notebook_path")
+                                .is_none_or(|path| *path == session["notebook_path"])
+                    })
+                    .collect();
+                if candidates.len() != 1 {
+                    return Err(if candidates.is_empty() {
+                        "NOT_FOUND: no matching live notebook; open it in the browser first"
+                    } else {
+                        "CONFLICT: multiple matching notebooks; provide session_id"
+                    }
+                    .into());
+                }
+                let session = candidates[0];
+                let revision = args
+                    .get("expected_revision")
+                    .unwrap_or(&session["revision"]);
+                let mut arguments = args.as_object().unwrap().clone();
+                for key in ["session_id", "expected_revision", "notebook_path"] {
+                    arguments.remove(key);
+                }
+                self.0.mcp_broker.dispatch(&json!({"session_id":session["session_id"],"notebook_path":session["notebook_path"],"expected_revision":revision,"operation":operation,"arguments":arguments}), ct).await
+            }
+            Operation::List | Operation::SourceRead | Operation::SourceWrite => {
                 let store = self.0.notebooks.clone();
-                let name = name.to_owned();
-                if name == "write_notebook" {
+                let operation = definition.operation;
+                let sessions = self.0.mcp_broker.list();
+                if matches!(operation, Operation::SourceWrite) {
                     let path = string(&args, "notebook_path")?;
-                    if self
-                        .0
-                        .mcp_broker
-                        .list()
+                    if sessions
                         .as_array()
                         .unwrap()
                         .iter()
                         .any(|s| s["notebook_path"] == path)
                     {
-                        return Err(
-                            "notebook is open in a browser; use execute_live_notebook".into()
-                        );
+                        return Err("CONFLICT: notebook is open in a browser; use notebook cell tools for unsaved edits".into());
                     }
                 }
                 tokio::task::spawn_blocking(move || -> Result<Value, String> {
-                    if name == "list_notebooks" {
+                    if matches!(operation, Operation::List) {
                         let listing = store.list().map_err(|error| error.message)?;
-                        return Ok(json!({"notebooks": listing.files, "directories": listing.directories}));
+                        let paths: Vec<_> = listing.files.iter().map(|file| file.path.clone()).collect();
+                        return Ok(json!({"ok":true,"kind":"notebook","operation":"notebook.list","cells":[],"count":paths.len(),"notebooks":paths,"sessions":sessions}));
                     }
-                    let path = validate_relative_path(string(&args, "notebook_path")?)
-                        .map_err(|error| error.message)?;
+                    let path = validate_relative_path(string(&args, "notebook_path")?).map_err(|error| error.message)?;
                     let notebook_path = slash_path(&path).map_err(|error| error.message)?;
-                    if name == "read_notebook" {
+                    if matches!(operation, Operation::SourceRead) {
                         let (source, revision) = store.read(&path).map_err(|error| error.message)?;
-                        Ok(json!({"notebook_path": notebook_path, "source": source, "revision": revision}))
+                        Ok(json!({"ok":true,"notebook_path":notebook_path,"source":source,"revision":revision}))
                     } else {
-                        let revision = store.write(
-                            &path,
-                            string(&args, "source")?.as_bytes(),
-                            string(&args, "expected_revision")?,
-                        ).map_err(|error| error.message)?;
-                        Ok(json!({"notebook_path": notebook_path, "revision": revision}))
+                        let revision = store.write(&path, string(&args, "source")?.as_bytes(), string(&args, "expected_revision")?).map_err(|error| error.message)?;
+                        Ok(json!({"ok":true,"notebook_path":notebook_path,"revision":revision,"mutation":{"saved":true}}))
                     }
-                })
-                .await
-                .map_err(|_| "notebook I/O failed".to_string())?
+                }).await.map_err(|_| "notebook I/O failed".to_string())?
             }
-            _ => Err("unknown tool".into()),
         }
     }
 }
@@ -445,12 +432,15 @@ impl ServerHandler for McpServer {
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: definitions(),
+            tools: definitions().into_iter().map(|d| d.tool).collect(),
             ..Default::default()
         })
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        definitions().into_iter().find(|tool| tool.name == name)
+        definitions()
+            .into_iter()
+            .map(|d| d.tool)
+            .find(|tool| tool.name == name)
     }
     async fn call_tool(
         &self,
@@ -465,8 +455,41 @@ impl ServerHandler for McpServer {
             )
             .await;
         Ok(match result {
+            Ok(mut value) if value.get("ok") == Some(&json!(false)) => {
+                if value.get("error").is_none() {
+                    value["error"] = value.get("cells").and_then(Value::as_array)
+                        .and_then(|cells| cells.iter().find_map(|cell| cell.get("error").filter(|error| error.is_object())))
+                        .cloned().unwrap_or_else(|| json!({"code":"OPERATION_FAILED","message":"Notebook operation failed"}));
+                }
+                CallToolResult::structured_error(value)
+            }
             Ok(value) => CallToolResult::structured(value),
-            Err(error) => CallToolResult::structured_error(json!({"error":error})),
+            Err(error) => {
+                let code = error
+                    .split_once(':')
+                    .map(|(code, _)| code)
+                    .filter(|code| {
+                        [
+                            "INVALID_ARGUMENT",
+                            "NOT_FOUND",
+                            "CONFLICT",
+                            "POLICY_BLOCKED",
+                        ]
+                        .contains(code)
+                    })
+                    .unwrap_or_else(|| {
+                        if error.contains("POLICY_BLOCKED:") { "POLICY_BLOCKED" } else if error.contains("revision") || error.contains("changed") {
+                            "CONFLICT"
+                        } else if error.contains("timed out") {
+                            "TIMEOUT"
+                        } else {
+                            "OPERATION_FAILED"
+                        }
+                    });
+                CallToolResult::structured_error(
+                    json!({"ok":false,"error":{"code":code,"message":error}}),
+                )
+            }
         }
         .into())
     }
@@ -536,6 +559,7 @@ mod tests {
         _: *const c_char,
         _: u64,
         _: u64,
+        _: bool,
     ) -> *mut c_char {
         let state = &*(context as *const TestQueryState);
         state.started.store(true, Ordering::Release);
@@ -573,8 +597,11 @@ mod tests {
         let ct = CancellationToken::new();
         let query_bridge = bridge.clone();
         let query_ct = ct.clone();
-        let task =
-            tokio::spawn(async move { query_bridge.execute("select 1".into(), 1, query_ct).await });
+        let task = tokio::spawn(async move {
+            query_bridge
+                .execute("select 1".into(), 1, true, query_ct)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !state.started.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(5)).await;

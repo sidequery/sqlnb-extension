@@ -197,7 +197,7 @@ assert.equal(
   true,
 );
 const startRows = await runSQL(
-  `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
+  `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}, mcp := true) as status`,
 );
 const start = JSON.parse(firstValue(startRows));
 assert.equal(start.engine, 'native-duckdb');
@@ -225,6 +225,83 @@ assert.equal(
   3,
 );
 const headers = { authorization: `Bearer ${token}` };
+
+// Exercise the actual C++ DuckDB bridge, not the HTTP layer's query mock.
+assert.equal(start.mcp.enabled, true);
+let mcpSession;
+let mcpRequestID = 0;
+async function mcpRequest(method, params, notification = false) {
+  const response = await fetch(start.mcp.url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${start.mcp.token}`,
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...(mcpSession ? { 'mcp-session-id': mcpSession, 'mcp-protocol-version': '2025-03-26' } : {}),
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', ...(notification ? {} : { id: ++mcpRequestID }), method, params }),
+  });
+  assert(response.ok, `MCP ${method} returned ${response.status}: ${await response.clone().text()}`);
+  mcpSession = response.headers.get('mcp-session-id') ?? mcpSession;
+  if (notification) return;
+  const body = await response.text();
+  const message = response.headers.get('content-type')?.includes('text/event-stream')
+    ? JSON.parse(body.split('\n').find((line) => line.startsWith('data: ') && line.slice(6).trim()).slice(6))
+    : JSON.parse(body);
+  assert.equal(message.error, undefined, JSON.stringify(message.error));
+  return message.result;
+}
+await mcpRequest('initialize', {
+  protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'native-runtime-smoke', version: '1' },
+});
+await mcpRequest('notifications/initialized', {}, true);
+async function mcpSQL(sql, execute = false, limit = 100) {
+  return mcpRequest('tools/call', {
+    name: execute ? 'sidequery.sql.execute' : 'sidequery.sql.query', arguments: { sql, limit },
+  });
+}
+function sqlToolValue(result) {
+  assert.notEqual(result.isError, true, JSON.stringify(result));
+  return result.structuredContent ?? JSON.parse(result.content.find((item) => item.type === 'text').text);
+}
+const readResult = sqlToolValue(await mcpSQL('select value from shared_table'));
+assert.deepEqual(readResult.rows, [{ value: 7 }]);
+assert.deepEqual(sqlToolValue(await mcpSQL("select 'insert; sqlnb_stop()' as text /* delete */")).rows, [{ text: 'insert; sqlnb_stop()' }]);
+const limited = sqlToolValue(await mcpSQL('select i::integer as n from range(3) t(i)', false, 1));
+assert.deepEqual(limited.rows, [{ n: 0 }]);
+assert.equal(limited.truncated, true);
+sqlToolValue(await mcpSQL('create table mcp_mutation_check (value integer)', true));
+sqlToolValue(await mcpSQL('create sequence mcp_sequence', true));
+sqlToolValue(await mcpSQL("create macro mcp_hidden_mutation() as nextval('mcp_sequence')", true));
+sqlToolValue(await mcpSQL("create view mcp_hidden_view as select nextval('mcp_sequence') as value", true));
+for (const sql of [
+  'insert into mcp_mutation_check values (999)',
+  'with input as (select 1) insert into mcp_mutation_check select * from input',
+  `copy shared_table to ${sqlLiteral(join(notebookRoot, 'must-not-write.csv'))}`,
+  'set threads = 1',
+  "select nextval('mcp_sequence')",
+  'select mcp_hidden_mutation()',
+  'select * from mcp_hidden_view',
+  'select sqlnb_stop()',
+  "select * from quack_serve('quack:127.0.0.1:0')",
+]) {
+  const rejected = await mcpSQL(sql);
+  assert.equal(rejected.isError, true, `read-only SQL was accepted: ${sql}`);
+  assert.equal(rejected.structuredContent.error.code, 'POLICY_BLOCKED');
+  assert.match(JSON.stringify(rejected), /POLICY_BLOCKED|read-only|mutation|volatile/i);
+  assert.deepEqual(sqlToolValue(await mcpSQL('select 42 as recovered')).rows, [{ recovered: 42 }]);
+}
+assert.deepEqual(sqlToolValue(await mcpSQL('select count(*)::integer as n from mcp_mutation_check')).rows, [{ n: 0 }]);
+assert.equal(existsSync(join(notebookRoot, 'must-not-write.csv')), false);
+sqlToolValue(await mcpSQL('insert into mcp_mutation_check values (12)', true));
+assert.deepEqual(sqlToolValue(await mcpSQL('select value from mcp_mutation_check')).rows, [{ value: 12 }]);
+assert.deepEqual(sqlToolValue(await mcpSQL("select nextval('mcp_sequence')::integer as n", true)).rows, [{ n: 1 }]);
+for (const execute of [false, true]) {
+  const rejected = await mcpSQL('select 1; insert into mcp_mutation_check values (999)', execute);
+  assert.equal(rejected.isError, true);
+  assert.match(JSON.stringify(rejected), /exactly one/i);
+}
+assert.deepEqual(sqlToolValue(await mcpSQL('select value from mcp_mutation_check')).rows, [{ value: 12 }]);
 
 const rootResponse = await fetch(`${start.baseUrl}/`);
 assert.equal(rootResponse.status, 200);
