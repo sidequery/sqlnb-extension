@@ -12,7 +12,9 @@ use axum::{
 #[cfg(test)]
 use bytes::Bytes;
 mod cache_location;
+mod history;
 mod mcp;
+mod project_git;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -172,6 +174,8 @@ struct NotebookStore {
     root_fd: OwnedFd,
     writes: Mutex<()>,
     recent_path: Option<PathBuf>,
+    history: history::History,
+    reconciliation_error: Mutex<Option<String>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1118,12 +1122,36 @@ impl NotebookStore {
     fn open(root: PathBuf) -> Result<Self, String> {
         let root_fd = open_directory(&root)
             .map_err(|error| format!("failed to open notebook root: {error}"))?;
+        let history = history::History::open(&root)?;
+        history
+            .lock()
+            .map_err(|e| e.message)?
+            .finish(true)
+            .map_err(|e| e.message)?;
         Ok(Self {
+            history,
+            reconciliation_error: Mutex::new(None),
             recent_path: cache_location::notebook_state_path(&root).ok(),
             root,
             root_fd,
             writes: Mutex::new(()),
         })
+    }
+
+    fn reconcile(&self) -> Result<(), ApiError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| file_io(std::io::Error::other("file lock poisoned")))?;
+        let mut history = self.history.lock()?;
+        history.finish(true)?;
+        for entry in self.list()?.files {
+            let path = validate_relative_path(&entry.path)?;
+            if let Ok((source, _)) = self.read(&path) {
+                history.observe(&entry.path, source.as_bytes(), "external")?;
+            }
+        }
+        history.enforce_retention()
     }
 
     fn list(&self) -> Result<NotebookListing, ApiError> {
@@ -1224,6 +1252,16 @@ impl NotebookStore {
     }
 
     fn write(&self, relative: &Path, source: &[u8], expected: &str) -> Result<String, ApiError> {
+        self.write_reason(relative, source, expected, "save")
+    }
+
+    fn write_reason(
+        &self,
+        relative: &Path,
+        source: &[u8],
+        expected: &str,
+        reason: &str,
+    ) -> Result<String, ApiError> {
         if source.len() > MAX_NOTEBOOK_BYTES {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1238,6 +1276,10 @@ impl NotebookStore {
                 "file lock is poisoned",
             )
         })?;
+        let mut history = self.history.lock()?;
+        history.finish(true)?;
+        let history_path = slash_path(relative)?;
+        let mut baseline = None;
         let (parent, name) = self.open_parent(relative, true)?;
         let current = open_file_at(parent.as_raw_fd(), &name);
         match (expected.is_empty(), current) {
@@ -1256,21 +1298,43 @@ impl NotebookStore {
                 if bytes.len() > MAX_NOTEBOOK_BYTES || revision(&bytes) != expected {
                     return Err(conflict("file changed since it was opened"));
                 }
+                baseline = Some(bytes);
             }
             (false, Err(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
                 return Err(conflict("file no longer exists"))
             }
             (false, Err(error)) => return Err(file_io(error)),
         }
-        atomic_write_at(parent.as_raw_fd(), &name, source, expected).map_err(|error| {
-            if error.raw_os_error() == Some(libc::EEXIST) {
-                conflict("file already exists")
-            } else if error.raw_os_error() == Some(libc::EBUSY) {
-                conflict("file changed since it was opened")
-            } else {
-                file_io(error)
+        if let Some(bytes) = baseline {
+            if bytes == source && reason == "save" {
+                return Ok(revision(source));
             }
-        })?;
+            history.capture(&history_path, &bytes, "baseline")?;
+        }
+        history.prepare(&history_path, source, reason, None)?;
+        let written =
+            atomic_write_at(parent.as_raw_fd(), &name, source, expected).map_err(|error| {
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    conflict("file already exists")
+                } else if error.raw_os_error() == Some(libc::EBUSY) {
+                    conflict("file changed since it was opened")
+                } else {
+                    file_io(error)
+                }
+            });
+        if let Err(error) = written {
+            // A failed directory fsync may follow a successful rename. Keep its intent.
+            if self
+                .read(relative)
+                .is_ok_and(|(_, r)| r == revision(source))
+            {
+                history.finish(true)?;
+            } else {
+                history.cancel()?;
+            }
+            return Err(error);
+        }
+        history.finish(false)?;
         Ok(revision(source))
     }
 
@@ -1314,6 +1378,8 @@ impl NotebookStore {
                 "file lock is poisoned",
             )
         })?;
+        let mut history = self.history.lock()?;
+        history.finish(true)?;
         let (source_parent, source_name) = self.open_parent(source, false)?;
         let source_file =
             open_file_at(source_parent.as_raw_fd(), &source_name).map_err(|error| {
@@ -1366,7 +1432,11 @@ impl NotebookStore {
         {
             return Err(conflict("file changed while it was being moved"));
         }
-        rename_no_replace(
+        let source_path = slash_path(source)?;
+        let destination_path = slash_path(destination)?;
+        history.capture(&source_path, &bytes, "baseline")?;
+        history.prepare(&source_path, &bytes, "rename", Some(&destination_path))?;
+        let moved = rename_no_replace(
             source_parent.as_raw_fd(),
             &source_name,
             destination_parent.as_raw_fd(),
@@ -1380,7 +1450,12 @@ impl NotebookStore {
             ),
             Some(libc::ENOENT) => conflict("file changed while it was being moved"),
             _ => file_io(error),
-        })?;
+        });
+        if let Err(error) = moved {
+            history.cancel()?;
+            return Err(error);
+        }
+        history.finish(false)?;
         // The rename is already committed at this point. Directory fsync is
         // best-effort: reporting an error would make the client believe the
         // source path still exists and leave its active document stale.
@@ -1459,7 +1534,7 @@ fn validate_relative_components(value: &str) -> Result<PathBuf, ApiError> {
     if path.is_absolute()
         || !path
             .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+            .all(|component| matches!(component, Component::Normal(name) if !name.as_encoded_bytes().eq_ignore_ascii_case(b".git")))
     {
         return Err(invalid_path());
     }
@@ -1557,7 +1632,10 @@ fn list_directory_fd(
             break;
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        if name.to_bytes() == b"."
+            || name.to_bytes() == b".."
+            || name.to_bytes().eq_ignore_ascii_case(b".git")
+        {
             continue;
         }
         let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
@@ -1907,6 +1985,254 @@ async fn bootstrap(
     ))
 }
 
+#[derive(Deserialize)]
+struct HistoryQuery {
+    path: String,
+    id: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreRequest {
+    path: String,
+    id: String,
+    expected_revision: String,
+}
+#[derive(Deserialize)]
+struct GitDiffQuery {
+    path: String,
+    #[serde(default)]
+    staged: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPathsRequest {
+    paths: Vec<String>,
+    expected_head: Option<String>,
+    expected_index: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitRequest {
+    paths: Vec<String>,
+    message: String,
+    expected_head: Option<String>,
+    expected_index: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPushRequest {
+    expected_head: String,
+}
+fn git_error(message: String) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "git_error", message)
+}
+async fn git_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let root = state.notebooks.root.clone();
+    let status = tokio::task::spawn_blocking(move || project_git::ProjectGit::new(root).status())
+        .await
+        .map_err(|e| git_error(e.to_string()))?
+        .map_err(git_error)?;
+    Ok(Json(status))
+}
+async fn git_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GitDiffQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    validate_relative_path(&query.path)?;
+    let root = state.notebooks.root.clone();
+    let diff = tokio::task::spawn_blocking(move || {
+        project_git::ProjectGit::new(root).diff(&query.path, query.staged)
+    })
+    .await
+    .map_err(|e| git_error(e.to_string()))?
+    .map_err(git_error)?;
+    Ok(Json(serde_json::json!({"diff":diff})))
+}
+async fn git_paths(
+    state: AppState,
+    headers: HeaderMap,
+    body: GitPathsRequest,
+    stage: bool,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticate(&headers, &state)?;
+    for path in &body.paths {
+        validate_relative_path(path)?;
+    }
+    let root = state.notebooks.root.clone();
+    tokio::task::spawn_blocking(move || {
+        let git = project_git::ProjectGit::new(root);
+        if stage {
+            git.stage(
+                &body.paths,
+                body.expected_head.as_deref(),
+                &body.expected_index,
+            )
+        } else {
+            git.unstage(
+                &body.paths,
+                body.expected_head.as_deref(),
+                &body.expected_index,
+            )
+        }
+    })
+    .await
+    .map_err(|e| git_error(e.to_string()))?
+    .map_err(git_error)?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+async fn git_stage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GitPathsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    git_paths(state, headers, body, true).await
+}
+async fn git_unstage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GitPathsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    git_paths(state, headers, body, false).await
+}
+async fn git_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GitCommitRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    for path in &body.paths {
+        validate_relative_path(path)?;
+    }
+    let root = state.notebooks.root.clone();
+    let head = tokio::task::spawn_blocking(move || {
+        project_git::ProjectGit::new(root).commit(
+            &body.message,
+            &body.paths,
+            body.expected_head.as_deref(),
+            &body.expected_index,
+        )
+    })
+    .await
+    .map_err(|e| git_error(e.to_string()))?
+    .map_err(git_error)?;
+    Ok(Json(serde_json::json!({"head":head})))
+}
+async fn git_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GitPushRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let root = state.notebooks.root.clone();
+    tokio::task::spawn_blocking(move || {
+        project_git::ProjectGit::new(root).push(&body.expected_head)
+    })
+    .await
+    .map_err(|e| git_error(e.to_string()))?
+    .map_err(git_error)?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+async fn git_init(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let root = state.notebooks.root.clone();
+    tokio::task::spawn_blocking(move || project_git::ProjectGit::new(root).init())
+        .await
+        .map_err(|e| git_error(e.to_string()))?
+        .map_err(git_error)?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn list_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let path = slash_path(&validate_relative_path(&query.path)?)?;
+    let store = state.notebooks.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let transaction = store.history.lock()?;
+        Ok::<_, ApiError>(serde_json::json!({
+            "revisions": transaction.list(&path),
+            "settings": transaction.settings(),
+            "retainedBytes": transaction.retained_bytes(),
+            "error": store.reconciliation_error.lock().ok().and_then(|error| error.clone()),
+        }))
+    })
+    .await
+    .map_err(|error| file_io(std::io::Error::other(error)))??;
+    Ok(Json(value))
+}
+async fn read_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let path = slash_path(&validate_relative_path(&query.path)?)?;
+    let store = state.notebooks.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let transaction = store.history.lock()?;
+        let bytes = transaction.read(&path, &query.id)?;
+        let source = String::from_utf8(bytes).map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_encoding",
+                "snapshot is not UTF-8",
+            )
+        })?;
+        Ok::<_, ApiError>(serde_json::json!({"id":query.id,"path":path,"source":source}))
+    })
+    .await
+    .map_err(|e| file_io(std::io::Error::other(e)))??;
+    Ok(Json(value))
+}
+async fn restore_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RestoreRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let path = validate_relative_path(&body.path)?;
+    let store = state.notebooks.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let source = store.history.lock()?.read(&slash_path(&path)?, &body.id)?;
+        let revision = store.write_reason(&path, &source, &body.expected_revision, "restore")?;
+        Ok::<_, ApiError>(PutFileResponse {
+            path: slash_path(&path)?,
+            revision,
+        })
+    })
+    .await
+    .map_err(|e| file_io(std::io::Error::other(e)))??;
+    Ok(Json(value))
+}
+async fn history_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<history::Settings>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let store = state.notebooks.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let mut transaction = store.history.lock()?;
+        transaction.configure(settings)?;
+        Ok::<_, ApiError>(transaction.settings())
+    })
+    .await
+    .map_err(|e| file_io(std::io::Error::other(e)))??;
+    Ok(Json(value))
+}
+
 async fn list_files(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2176,6 +2502,20 @@ fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/files", get(list_files))
+        .route("/api/v1/git", get(git_status))
+        .route("/api/v1/git/diff", get(git_diff))
+        .route("/api/v1/git/stage", post(git_stage))
+        .route("/api/v1/git/unstage", post(git_unstage))
+        .route("/api/v1/git/commit", post(git_commit))
+        .route("/api/v1/git/push", post(git_push))
+        .route("/api/v1/git/init", post(git_init))
+        .route("/api/v1/history", get(list_history))
+        .route("/api/v1/history/revision", get(read_history))
+        .route("/api/v1/history/restore", post(restore_history))
+        .route(
+            "/api/v1/history/settings",
+            axum::routing::put(history_settings),
+        )
         .route(
             "/api/v1/recent-notebook",
             get(get_recent_notebook).put(put_recent_notebook),
@@ -2238,6 +2578,7 @@ fn start_with_query(
     let mut state = build_state(config, port)?;
     state.mcp_query = query;
     let mcp_shutdown = state.mcp_shutdown.clone();
+    let notebooks = state.notebooks.clone();
     let app = router(state);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -2264,6 +2605,25 @@ fn start_with_query(
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
+                let mut reconcile_rx = shutdown_rx.clone();
+                let reconcile = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(2));
+                    loop {
+                        tokio::select! {
+                            _ = reconcile_rx.changed() => break,
+                            _ = interval.tick() => {
+                                let store = notebooks.clone();
+                                // Polling avoids platform watcher overflow and traverses through secured fds.
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let result = store.reconcile();
+                                    if let Ok(mut error) = store.reconciliation_error.lock() {
+                                        *error = result.err().map(|error| error.message);
+                                    }
+                                }).await;
+                            }
+                        }
+                    }
+                });
                 let mut graceful_rx = shutdown_rx;
                 let wait_for_shutdown = async move {
                     while !*graceful_rx.borrow() && graceful_rx.changed().await.is_ok() {}
@@ -2272,6 +2632,7 @@ fn start_with_query(
                 let _ = axum::serve(listener, app)
                     .with_graceful_shutdown(wait_for_shutdown)
                     .await;
+                let _ = reconcile.await;
             });
         })
         .map_err(|error| format!("failed to start SQLNB server thread: {error}"))?;

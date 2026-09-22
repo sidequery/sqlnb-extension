@@ -1310,6 +1310,127 @@ fn ffi_server_binds_reports_port_and_stops() {
 }
 
 #[tokio::test]
+async fn history_api_auth_read_restore_conflict_and_settings() {
+    let fixture = Fixture::new();
+    let path = Path::new("history.sql");
+    let first = fixture
+        .state
+        .notebooks
+        .write(path, b"select 1", "")
+        .unwrap();
+    let second = fixture
+        .state
+        .notebooks
+        .write(path, b"select 2", &first)
+        .unwrap();
+    let app = router(fixture.state.clone());
+    let response = app
+        .clone()
+        .oneshot(fixture.request("GET", "/api/v1/history?path=history.sql", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["revisions"].as_array().unwrap().len(), 2);
+    let id = body["revisions"][1]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "POST",
+            "/api/v1/history/restore",
+            Some(json!({"path":"history.sql","id":id,"expectedRevision":"stale"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "POST",
+            "/api/v1/history/restore",
+            Some(json!({"path":"history.sql","id":id,"expectedRevision":second})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fs::read(fixture.root.join(path)).unwrap(), b"select 1");
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "PUT",
+            "/api/v1/history/settings",
+            Some(json!({"maxAgeDays":30,"maxRevisions":2,"maxBytes":16777216})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut request = fixture.request("GET", "/api/v1/history?path=history.sql", None);
+    request.headers_mut().remove(header::AUTHORIZATION);
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = app
+        .oneshot(fixture.request("GET", "/api/v1/history?path=../history.sql", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn history_polling_captures_external_changes_and_stops_with_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let notebooks = temp.path().join("notebooks");
+    fs::create_dir(&assets).unwrap();
+    fs::create_dir(&notebooks).unwrap();
+    fs::write(assets.join("index.html"), "ok").unwrap();
+    fs::write(notebooks.join("external.sql"), "first").unwrap();
+    let mut handle = start(ServerConfig {
+        port: 0,
+        local_asset_directory: assets.display().to_string(),
+        remote_asset_url: String::new(),
+        quack_url: "http://127.0.0.1:49999/quack".into(),
+        token: "test".into(),
+        mcp_token: String::new(),
+        duckdb_version: "test".into(),
+        notebook_root: notebooks.display().to_string(),
+    })
+    .unwrap();
+    let store = NotebookStore::open(notebooks.canonicalize().unwrap()).unwrap();
+    let await_source = |expected: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let transaction = store.history.lock().unwrap();
+            if transaction
+                .list("external.sql")
+                .first()
+                .is_some_and(|r| transaction.read("external.sql", &r.id).unwrap() == expected)
+            {
+                break;
+            }
+            drop(transaction);
+            assert!(
+                Instant::now() < deadline,
+                "external snapshot was not captured"
+            );
+            thread::sleep(Duration::from_millis(40));
+        }
+    };
+    await_source(b"first");
+    fs::write(store.root.join("external.sql"), "second").unwrap();
+    await_source(b"second");
+    handle.stop();
+    let count = store.history.lock().unwrap().list("external.sql").len();
+    fs::write(store.root.join("external.sql"), "after stop").unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(
+        store.history.lock().unwrap().list("external.sql").len(),
+        count
+    );
+}
+
+#[tokio::test]
 async fn mcp_is_opt_in_and_has_an_independent_capability() {
     let mut fixture = Fixture::new();
     let response = router(fixture.state.clone())
