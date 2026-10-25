@@ -18,7 +18,7 @@ load sqlnb from sidequery;
 select sqlnb_start();
 ```
 
-On supported DuckDB alpha builds, SQLNB installs and loads Quack from the same trusted Sidequery repository when it starts. It also loads the matching core `httpfs` and `icu` extensions through DuckDB's normal core autoloading policy, so those dependencies do not need separate `load` statements.
+On DuckDB 2.0, SQLNB installs and loads Quack from the same trusted Sidequery repository when it starts. It also loads the matching core `httpfs` and `icu` extensions through DuckDB's normal core autoloading policy, so those dependencies do not need separate `load` statements.
 
 ## Build and run
 
@@ -40,7 +40,7 @@ select sqlnb_start();
 
 The database process must remain running. `sqlnb_status()` reports its local URL; `sqlnb_stop()` stops the UI server. Notebook listing, saving, folders, and moves use the extension's local file API without browser filesystem permissions.
 
-On DuckDB 2.0 alpha builds, startup options are named and optional. Override only what you need:
+On DuckDB 2.0, startup options are named and optional. Override only what you need:
 
 ```sql
 select sqlnb_start(
@@ -66,6 +66,38 @@ On Linux, an absolute `XDG_CACHE_HOME` works even when `HOME` is unset. Empty or
 New releases live in a separate `managed-v1` directory. Cache cleanup retains the current release, one verified fallback, and releases leased by running extension instances. Obsolete managed releases are removed after their leases are released. Older cache directories are kept as read-only offline fallbacks, since older extension processes do not support leases and may still be using them.
 
 No UI source checkout or frontend build is required by the installed extension.
+
+## Private repository release build
+
+For official DuckDB `v2.0.0` (source `d54cbbe3df`), use the matching official CLI:
+
+```sh
+scripts/build-release.sh --duckdb /absolute/path/to/v2.0.0/duckdb
+```
+
+The macOS build pins DuckDB's final source and its tested Quack revision
+`f96420ed46aee9c42064bdb99ddfd1230d6c0086`. It builds static OpenSSL 3.6.3,
+runs the Rust tests (including the deployed UI check) and native smoke suite,
+then retains Quack and SQLNB in `.artifacts/v2.0.0/<platform>/` with source
+provenance and SHA-256 checksums. All native code targets macOS 11.0. Build
+concurrency defaults to two; set `CMAKE_BUILD_PARALLEL_LEVEL` to change it.
+Install Rust 1.99.0 through rustup before building; this profile selects its
+distributable standard library so Homebrew's host deployment target cannot leak
+into the extension.
+
+Sign both artifacts using the monorepo's `tools/extension-repository` operator
+tool. Run its signed native smoke and browser qualification before publishing
+`quack`, then `sqlnb`, to `https://extensions.sidequery.dev`. Core `httpfs` and
+`icu` remain official DuckDB dependencies and are not republished by Sidequery.
+After publication, verify a fresh signed installation:
+
+```sh
+bun scripts/runtime-smoke.mjs --duckdb /absolute/path/to/v2.0.0/duckdb \
+  --repository https://extensions.sidequery.dev
+```
+
+The stable 1.5.4 and alpha profiles below remain available for their exact
+runtimes; their C++ artifacts cannot be relabeled as final 2.0 builds.
 
 ## Private repository alpha build
 
@@ -178,7 +210,7 @@ even when its repository is an ancestor directory.
 
 ## Local MCP server
 
-MCP is disabled by default. On DuckDB alpha, enable it explicitly:
+MCP is disabled by default. On DuckDB 2.0, enable it explicitly:
 
 ```sql
 select sqlnb_start(mcp := true, notebook_root := '~/Documents/notebooks');
