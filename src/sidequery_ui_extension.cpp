@@ -26,6 +26,11 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
+#if __has_include("duckdb/main/query_result_stream.hpp")
+#include "duckdb/main/query_result_stream.hpp"
+#define SQLNB_HAS_RESULT_STREAM 1
+#endif
+
 #if __has_include("duckdb/main/extension_repository_manager.hpp")
 #include "duckdb/main/extension_repository_manager.hpp"
 #define SQLNB_HAS_USER_EXTENSION_REPOSITORIES 1
@@ -395,6 +400,9 @@ private:
     if (statements.size() != 1) {
       throw InvalidInputException("MCP SQL tools require exactly one SQL statement");
     }
+#ifdef SQLNB_HAS_RESULT_STREAM
+    auto statement_type = statements[0]->type;
+#endif
     unique_ptr<PreparedStatement> prepared;
     unique_ptr<QueryResult> result;
     if (read_only) {
@@ -413,24 +421,47 @@ private:
       }
       auto plan = connection.ExtractPlan(sql);
       CheckReadOnlyPlan(*plan);
+#ifdef SQLNB_HAS_RESULT_STREAM
+      result = prepared->Submit();
+#else
       result = prepared->Execute();
+#endif
     } else {
+#ifdef SQLNB_HAS_RESULT_STREAM
+      result = connection.Submit(std::move(statements[0]));
+#else
       result = connection.SendQuery(std::move(statements[0]));
+#endif
     }
     if (!result || result->HasError()) {
       throw IOException("%s", result ? result->GetError() : "query returned no result");
     }
+#ifdef SQLNB_HAS_RESULT_STREAM
+    // Final 2.0 separates submitted queries from their streaming readers.
+    // Only read-only SELECTs may stop early; drain writes so truncating their
+    // returned rows never rolls back an otherwise successful statement.
+    if (StreamsByDefault(statement_type, *result, false)) {
+      QueryResultStream<> stream(std::move(result));
+      return SerializeResult(stream, max_rows, max_bytes);
+    }
+    result->Collection();
+#endif
+    return SerializeResult(*result, max_rows, max_bytes);
+  }
+
+  template <class RESULT>
+  static string SerializeResult(RESULT &result, uint64_t max_rows, uint64_t max_bytes) {
     string response = "{\"columns\":[";
     string types = "],\"types\":[";
     vector<string> names;
     unordered_set<string> used_names;
-    for (idx_t column = 0; column < result->ColumnCount(); column++) {
+    for (idx_t column = 0; column < result.ColumnCount(); column++) {
 #ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
-      auto original_name = result->ColumnName(column).GetIdentifierName();
-      auto type = result->GetTypes()[column];
+      auto original_name = result.ColumnName(column).GetIdentifierName();
+      auto type = result.GetTypes()[column];
 #else
-      auto original_name = result->names[column];
-      auto type = result->types[column];
+      auto original_name = result.names[column];
+      auto type = result.types[column];
 #endif
       auto name = original_name;
       auto suffix = 1;
@@ -447,7 +478,7 @@ private:
     }
     uint64_t count = 0;
     bool truncated = false;
-    while (auto chunk = result->Fetch()) {
+    while (auto chunk = result.Fetch()) {
       for (idx_t row = 0; row < chunk->size(); row++) {
         if (count >= max_rows) {
           truncated = true;
@@ -472,8 +503,8 @@ private:
         break;
       }
     }
-    if (result->HasError()) {
-      throw IOException("%s", result->GetError());
+    if (result.HasError()) {
+      throw IOException("%s", result.GetError());
     }
     return response + "],\"returned_rows\":" + std::to_string(count) +
            ",\"truncated\":" + (truncated ? "true}" : "false}");

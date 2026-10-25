@@ -154,7 +154,9 @@ function expectSQLError(sql, expectedMessage) {
       }
     }
     child.stderr.on('data', onData);
-    child.stdin.write(`${sql};\n`);
+    // The final CLI can emit the opening JSON bracket before a streaming
+    // statement throws. Keep expected failures from corrupting the next row.
+    child.stdin.write(`.output /dev/null\n${sql};\n.output stdout\n`);
   });
 }
 
@@ -270,6 +272,20 @@ assert.deepEqual(sqlToolValue(await mcpSQL("select 'insert; sqlnb_stop()' as tex
 const limited = sqlToolValue(await mcpSQL('select i::integer as n from range(3) t(i)', false, 1));
 assert.deepEqual(limited.rows, [{ n: 0 }]);
 assert.equal(limited.truncated, true);
+if (firstValue(await runSQL('select version()')) === 'v2.0.0') {
+  // Submit/QueryResultStream must stop a read at its row limit instead of
+  // materializing a trillion rows. Both MCP SQL entrypoints share this path.
+  for (const execute of [false, true]) {
+    const streamed = sqlToolValue(await mcpSQL('select i::integer as n from range(1000000000000) t(i)', execute, 1));
+    assert.deepEqual(streamed.rows, [{ n: 0 }]);
+    assert.equal(streamed.truncated, true);
+  }
+  sqlToolValue(await mcpSQL('create table mcp_returning_check (value integer)', true));
+  const inserted = sqlToolValue(await mcpSQL('insert into mcp_returning_check select i from range(10000) t(i) returning value', true, 1));
+  assert.equal(inserted.rows.length, 1);
+  assert.equal(inserted.truncated, true);
+  assert.deepEqual(sqlToolValue(await mcpSQL('select count(*)::integer as n from mcp_returning_check')).rows, [{ n: 10000 }]);
+}
 sqlToolValue(await mcpSQL('create table mcp_mutation_check (value integer)', true));
 sqlToolValue(await mcpSQL('create sequence mcp_sequence', true));
 sqlToolValue(await mcpSQL("create macro mcp_hidden_mutation() as nextval('mcp_sequence')", true));
