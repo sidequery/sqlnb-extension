@@ -182,6 +182,10 @@ private:
       return;
     case TableReferenceType::BASE_TABLE: {
       auto &table = reference.Cast<BaseTableRef>();
+      // DuckDB evaluates AT expressions during binding, even when the catalog
+      // subsequently rejects time travel. Native catalogs admitted here do not
+      // support it, so reject before any hidden expression can execute.
+      if (table.at_clause) Reject();
       // Missing tables are rejected before replacement scans (including files)
       // can run. Views and generated columns can conceal calls: fail closed.
       auto entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::TABLE_ENTRY, table.GetQualifiedName()),

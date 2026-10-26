@@ -198,6 +198,27 @@ assert.equal(
   firstValue(await runSQL('create temp table caller_temp as select 9::integer as value; select true')),
   true,
 );
+// Instant SQL is available on the final 2.0 binding API. An AT expression is
+// evaluated at bind time, before DuckDB rejects time travel on native tables.
+const hasReadPolicy = firstValue(await runSQL(
+  "select count(*) from duckdb_functions() where function_name = 'sqlnb_read_query'",
+)) > 0;
+if (hasReadPolicy) {
+  assert.equal(firstValue(await runSQL(
+    "create sequence instant_policy_sequence; select nextval('instant_policy_sequence')",
+  )), 1);
+  const unsafeRead = "select * from shared_table at (version => nextval('instant_policy_sequence'))";
+  assert.equal(firstValue(await runSQL(`select sqlnb_is_read_only(${sqlLiteral(unsafeRead)})`)), false);
+  await expectSQLError(
+    `select * from sqlnb_read_query(${sqlLiteral(unsafeRead)})`,
+    /SQLNB_READ_ONLY/,
+  );
+  assert.equal(firstValue(await runSQL("select currval('instant_policy_sequence')")), 1);
+  assert.deepEqual(
+    await runSQL("select * from sqlnb_read_query('select * from shared_table')"),
+    [{ value: 7 }],
+  );
+}
 const startRows = await runSQL(
   `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}, mcp := true) as status`,
 );
