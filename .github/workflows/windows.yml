@@ -1,0 +1,33 @@
+name: Windows qualification
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: oven-sh/setup-bun@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Allow symlink security fixtures
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force
+      - name: Install build cache in the disposable runner
+        shell: pwsh
+        run: |
+          cargo install mbx --version 1.27.0 --locked --root "$env:RUNNER_TEMP/mbx"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP/mbx/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Rust contracts and Windows filesystem security
+        shell: pwsh
+        run: |
+          mbx test --manifest-path http/Cargo.toml --locked -- --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build native extension and exercise HTTP bridge
+        shell: pwsh
+        run: ./scripts/qualify-windows.ps1

@@ -2,7 +2,7 @@
 use super::*;
 use git2::{Oid, Repository, Signature};
 use std::collections::BTreeMap;
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,7 +57,7 @@ struct Journal {
 pub(super) struct History {
     directory: PathBuf,
     root: PathBuf,
-    root_fd: OwnedFd,
+    root_fd: File,
 }
 pub(super) struct Transaction<'a> {
     history: &'a History,
@@ -80,17 +80,12 @@ fn now() -> u64 {
 }
 fn persist(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(err)?;
+    let mut file = private_new_file(&temporary).map_err(err)?;
     file.write_all(bytes).map_err(err)?;
     file.sync_all().map_err(err)?;
     fs::rename(&temporary, path).map_err(err)?;
-    File::open(path.parent().unwrap())
-        .and_then(|f| f.sync_all())
+    open_directory(path.parent().unwrap())
+        .and_then(|f| sync_directory(f.platform_handle()))
         .map_err(err)
 }
 impl History {
@@ -98,27 +93,26 @@ impl History {
         #[cfg(target_os = "macos")]
         let base = PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable for history")?)
             .join("Library/Application Support");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))
             .ok_or("history state directory unavailable")?;
+        #[cfg(windows)]
+        let base = cache_location::windows_local_data()?;
         Self::at(
             root,
             base.join("sidequery/sqlnb-history")
-                .join(revision(root.as_os_str().as_bytes())),
+                .join(revision(root.as_os_str().as_encoded_bytes())),
         )
     }
     fn at(root: &Path, directory: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        if fs::symlink_metadata(&directory)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
+        if is_reparse(&fs::symlink_metadata(&directory).map_err(|e| e.to_string())?) {
             return Err("history directory must not be a symlink".into());
         }
+        #[cfg(unix)]
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
         let history = Self {
@@ -127,7 +121,7 @@ impl History {
             root_fd: open_directory(root).map_err(|error| error.to_string())?,
         };
         let lock = open_lock_file(&history.directory.join("lock"))?;
-        lock_file(&lock, libc::LOCK_EX, "notebook history")?;
+        lock_file(&lock, LOCK_EX, "notebook history")?;
         let repo = Repository::init_bare(history.directory.join("snapshots.git"))
             .map_err(|e| e.to_string())?;
         repo.config()
@@ -142,24 +136,20 @@ impl History {
             return Err(invalid_path());
         };
         let name = cstring_component(name)?;
-        let duplicate = unsafe { libc::dup(self.root_fd.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(file_io(std::io::Error::last_os_error()));
-        }
-        let mut directory = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        let mut directory = self.root_fd.try_clone().map_err(file_io)?;
         for component in components {
             let Component::Normal(component) = component else {
                 return Err(invalid_path());
             };
-            match open_directory_at(directory.as_raw_fd(), &cstring_component(component)?) {
+            match open_directory_at(directory.platform_handle(), &cstring_component(component)?) {
                 Ok(next) => directory = next,
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(file_io(error)),
             }
         }
-        let file = match open_file_at(directory.as_raw_fd(), &name) {
+        let file = match open_file_at(directory.platform_handle(), &name) {
             Ok(file) => file,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(file_io(error)),
         };
         let metadata = file.metadata().map_err(file_io)?;
@@ -177,7 +167,7 @@ impl History {
     }
     pub fn lock(&self) -> Result<Transaction<'_>, ApiError> {
         let lock = open_lock_file(&self.directory.join("lock")).map_err(err)?;
-        lock_file(&lock, libc::LOCK_EX, "notebook history").map_err(err)?;
+        lock_file(&lock, LOCK_EX, "notebook history").map_err(err)?;
         let path = self.directory.join("catalog.json");
         let catalog = if path.exists() {
             serde_json::from_slice(&fs::read(path).map_err(err)?).map_err(err)?
@@ -295,12 +285,8 @@ impl Transaction<'_> {
             let directory = objects.join(&hex[..2]);
             let object = directory.join(&hex[2..]);
             if object.exists() {
-                File::open(object)
-                    .and_then(|file| file.sync_all())
-                    .map_err(err)?;
-                File::open(directory)
-                    .and_then(|file| file.sync_all())
-                    .map_err(err)?;
+                sync_history_path(&object).map_err(err)?;
+                sync_history_path(&directory).map_err(err)?;
             }
         }
         for path in [
@@ -310,9 +296,7 @@ impl Transaction<'_> {
             self.repo.path().join("refs"),
             self.repo.path().to_owned(),
         ] {
-            File::open(path)
-                .and_then(|file| file.sync_all())
-                .map_err(err)?;
+            sync_history_path(&path).map_err(err)?;
         }
         Ok(Revision {
             id: id.to_string(),
@@ -429,9 +413,7 @@ impl Transaction<'_> {
             self.save()?;
         }
         fs::remove_file(journal).map_err(err)?;
-        File::open(&self.history.directory)
-            .and_then(|f| f.sync_all())
-            .map_err(err)?;
+        sync_history_path(&self.history.directory).map_err(err)?;
         self.prune()
     }
     pub fn cancel(&mut self) -> Result<(), ApiError> {
@@ -536,11 +518,9 @@ impl Transaction<'_> {
             builder.write(&packs, 0o600).map_err(err)?;
         }
         for entry in fs::read_dir(&packs).map_err(err)? {
-            File::open(entry.map_err(err)?.path())
-                .and_then(|f| f.sync_all())
-                .map_err(err)?;
+            sync_history_path(&entry.map_err(err)?.path()).map_err(err)?;
         }
-        File::open(&packs).and_then(|f| f.sync_all()).map_err(err)?;
+        sync_history_path(&packs).map_err(err)?;
         // All live objects are durably packed. Remove loose objects and superseded packs only.
         for entry in fs::read_dir(&objects).map_err(err)? {
             let entry = entry.map_err(err)?;
@@ -937,7 +917,7 @@ mod tests {
         let (temp, store) = fixture();
         let outside = temp.path().join("outside.sql");
         fs::write(&outside, b"private").unwrap();
-        std::os::unix::fs::symlink(outside, store.root.join("linked.sql")).unwrap();
+        crate::tests::symlink(outside, store.root.join("linked.sql")).unwrap();
         store.reconcile().unwrap();
         assert!(store.history.lock().unwrap().list("linked.sql").is_empty());
         assert!(store

@@ -19,6 +19,8 @@ uint16_t sidequery_http_port(void *server);
 void sidequery_http_stop(void *server);
 void sidequery_http_string_free(char *value);
 uint16_t sidequery_http_unused_port(void);
+// A null previous validates a new notebook and starts its content version at 1.
+char *sidequery_duckdb_ui_next_version(const char *previous, const char *edited, char **error_out);
 
 #ifdef __cplusplus
 }

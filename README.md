@@ -55,6 +55,50 @@ For local UI development, use `assets := '/absolute/path/to/assets'`; local asse
 
 The authenticated `GET /api/v1/recent-notebook` endpoint returns `{ "path": "relative.sqlnb" }`, or `{ "path": null }` when no readable recent notebook is available. The UI records a successful open or save using `PUT` to the same endpoint with `{ "path": "relative.sqlnb" }`. The path must identify an existing notebook within the configured root. This preference survives server restarts and port changes and is isolated by canonical notebook root under the OS cache's `sidequery/sqlnb-extension/notebooks` directory. It contains only the relative path; unavailable or corrupt preferences do not affect normal notebook file operations.
 
+## DuckDB UI notebooks
+
+The local DuckDB UI launched by `duckdb -ui` stores its notebooks in a DuckDB
+database at `~/.duckdb/extension_data/ui/ui.db`. SQLNB exposes existing notebooks
+as a second live source alongside local SQLNB files. Opening a notebook does not
+execute it; saving edits writes a new version to that same database.
+
+The browser uses three native SQL functions, each returning a JSON string:
+
+```sql
+select sqlnb_duckdb_ui_notebooks();
+select sqlnb_duckdb_ui_notebook('notebook-uuid');
+select sqlnb_duckdb_ui_save('notebook-uuid', expected_entity_version, 'Title', 'edited notebook JSON');
+```
+
+Reads return the official ID, entity version, title and stored notebook JSON.
+Listing omits the JSON bodies. Saves require serialization format 3 and both the
+expected entity version and unchanged content version. An accepted save advances
+both versions and expires the preceding current revision in seven days, matching
+the official UI. Conflicts and malformed edits roll back. Notebook identity,
+creation time, internal name, current-notebook preference, unknown JSON fields
+and historical revisions remain intact. Browsing never creates or migrates a
+database, and `enable_external_access` must be enabled.
+
+An official UI catalog already attached to the host instance takes precedence;
+otherwise each operation opens the existing default database for its duration.
+Normal DuckDB locks apply. A separate process holding a write lock prevents
+access; stop that process or run both UIs in the same DuckDB instance. No lock
+bypass or database copy is used. The current adapter supports editing existing
+notebooks, not creating or deleting notebook records.
+
+The frontend owns conversion through the canonical Rust SQLNB parser and
+serializer. Cell IDs, database choices, grouping, comments and SQLNB directives
+survive saves. Features the official UI does not implement remain SQLNB source
+comments, with a compatibility notice in SQLNB. The official UI must reopen or
+refresh a notebook to see saved edits. SQLNB refreshes clean documents and retains
+dirty drafts when another editor changes the source.
+
+The native source smoke uses an isolated home directory and database:
+
+```sh
+bun scripts/duckdb-ui-smoke.mjs /absolute/path/to/duckdb /absolute/path/to/sqlnb.duckdb_extension
+```
+
 ## Deployment contract
 
 The stable base URL serves `manifest.json` with `version` (7–64 lowercase hexadecimal characters), `bridgeVersion: 1`, an optional relative `assetBase` directory, and a sorted `files` array of `{path, sha256, size}`. File paths are relative to the asset base and include `index.html`. Publish the manifest together with its complete immutable generation. Incompatible bridge versions are rejected; capabilities beyond the native bridge require an extension update.

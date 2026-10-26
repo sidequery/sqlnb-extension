@@ -12,6 +12,11 @@ use axum::{
 #[cfg(test)]
 use bytes::Bytes;
 mod cache_location;
+mod platform;
+#[cfg(windows)]
+mod windows_process;
+use platform::*;
+mod duckdb_ui;
 mod history;
 mod mcp;
 mod project_git;
@@ -22,9 +27,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-    os::unix::ffi::OsStringExt,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     ptr,
     sync::{mpsc, Arc, Mutex},
@@ -35,8 +37,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 use url::Url;
 
-#[cfg(not(unix))]
-compile_error!("sidequery-ui-http currently supports macOS and Linux");
+#[cfg(not(any(unix, windows)))]
+compile_error!("sidequery-ui-http supports macOS, Linux, and Windows");
 
 const MAX_QUACK_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NOTEBOOK_BYTES: usize = 16 * 1024 * 1024;
@@ -133,13 +135,13 @@ struct CacheTransaction {
 impl CacheTransaction {
     fn lock(cache_scope: &Path) -> Result<Self, String> {
         let file = open_lock_file(&cache_scope.join(ASSET_CACHE_LOCK))?;
-        lock_file(&file, libc::LOCK_EX, "UI cache transaction")?;
+        lock_file(&file, LOCK_EX, "UI cache transaction")?;
         Ok(Self { file })
     }
 
     fn try_lock(cache_scope: &Path) -> Result<Option<Self>, String> {
         let file = open_lock_file(&cache_scope.join(ASSET_CACHE_LOCK))?;
-        match try_lock_file(&file, libc::LOCK_EX, "UI cache transaction")? {
+        match try_lock_file(&file, LOCK_EX, "UI cache transaction")? {
             true => Ok(Some(Self { file })),
             false => Ok(None),
         }
@@ -171,7 +173,7 @@ struct AssetManifestFile {
 
 struct NotebookStore {
     root: PathBuf,
-    root_fd: OwnedFd,
+    root_fd: File,
     writes: Mutex<()>,
     recent_path: Option<PathBuf>,
     history: history::History,
@@ -293,6 +295,21 @@ struct MoveFileRequest {
 struct MoveFileResponse {
     path: String,
     revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateFileRequest {
+    path: String,
+    destination_path: String,
+    expected_revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteFileRequest {
+    path: String,
+    expected_revision: String,
 }
 
 #[derive(Deserialize)]
@@ -463,51 +480,6 @@ fn resolve_remote_assets_with_budget(
             .map_err(|error| format!("failed to resolve cached UI asset directory: {error}"))?,
         _lease: lease,
     })
-}
-
-fn open_lock_file(path: &Path) -> Result<File, String> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| format!("failed to open UI cache lock {}: {error}", path.display()))
-}
-
-fn lock_file(file: &File, operation: libc::c_int, label: &str) -> Result<(), String> {
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(format!("failed to lock {label}: {error}"));
-        }
-    }
-}
-
-fn try_lock_file(file: &File, operation: libc::c_int, label: &str) -> Result<bool, String> {
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
-            return Ok(true);
-        }
-        let error = std::io::Error::last_os_error();
-        if error
-            .raw_os_error()
-            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
-        {
-            return Ok(false);
-        }
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(format!("failed to lock {label}: {error}"));
-        }
-    }
-}
-
-fn unlock_file(file: &File) -> Result<(), String> {
-    lock_file(file, libc::LOCK_UN, "UI cache file")
 }
 
 fn asset_client() -> Result<reqwest::blocking::Client, String> {
@@ -890,7 +862,7 @@ fn select_valid_fallback(cache_scope: &Path) -> Result<PathBuf, String> {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if is_reparse(&metadata) || !metadata.is_dir() {
             continue;
         }
         if validate_cached_generation(&path, None).is_ok() {
@@ -917,17 +889,13 @@ fn acquire_generation_lease(
     match fs::symlink_metadata(&lease_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("failed to inspect UI generation lease: {error}")),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata) if is_reparse(&metadata) || !metadata.is_file() => {
             Err("UI generation lease marker is not a regular file".into())
         }
         Ok(_) => {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-                .open(&lease_path)
+            let file = open_lease_file(&lease_path)
                 .map_err(|error| format!("failed to open UI generation lease: {error}"))?;
-            lock_file(&file, libc::LOCK_SH, "UI generation lease")?;
+            lock_file(&file, LOCK_SH, "UI generation lease")?;
             Ok(Some(GenerationLease {
                 file: Some(file),
                 cache_scope: cache_scope.to_path_buf(),
@@ -953,7 +921,7 @@ fn prune_generations_locked(cache_scope: &Path) -> Result<(), String> {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if is_reparse(&metadata) || !metadata.is_dir() {
             continue;
         }
         let Some(cache_id) = entry.file_name().to_str().map(str::to_owned) else {
@@ -985,18 +953,13 @@ fn prune_generations_locked(cache_scope: &Path) -> Result<(), String> {
             // an older process may still have the directory pinned.
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if is_reparse(&metadata) || !metadata.is_file() {
             continue;
         }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&lease_path)
-        else {
+        let Ok(file) = open_lease_file(&lease_path) else {
             continue;
         };
-        if try_lock_file(&file, libc::LOCK_EX, "UI generation lease")? {
+        if try_lock_file(&file, LOCK_EX, "UI generation lease")? {
             fs::remove_dir_all(&path).map_err(|error| {
                 format!("failed to remove obsolete UI generation {cache_id}: {error}")
             })?;
@@ -1036,7 +999,7 @@ fn validate_cached_generation(
         let path = generation.join(relative);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("failed to inspect cached UI asset {}: {error}", file.path))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != file.size {
+        if is_reparse(&metadata) || !metadata.is_file() || metadata.len() != file.size {
             return Err(format!(
                 "cached UI asset {} has invalid metadata",
                 file.path
@@ -1097,8 +1060,8 @@ fn notebook_root(configured: &str) -> Result<PathBuf, String> {
         configured
     };
     let path = if configured == "~" || configured.starts_with("~/") {
-        let home =
-            std::env::var_os("HOME").ok_or("HOME is unavailable; notebookRoot must be absolute")?;
+        let home = home_directory()
+            .ok_or("home directory is unavailable; notebookRoot must be absolute")?;
         let suffix = configured.strip_prefix("~/").unwrap_or("");
         PathBuf::from(home).join(suffix)
     } else {
@@ -1111,7 +1074,7 @@ fn notebook_root(configured: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to create notebook root: {error}"))?;
     let metadata = fs::symlink_metadata(&path)
         .map_err(|error| format!("failed to inspect notebook root: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if is_reparse(&metadata) || !metadata.is_dir() {
         return Err("notebookRoot must be a real directory, not a symlink".into());
     }
     path.canonicalize()
@@ -1158,7 +1121,7 @@ impl NotebookStore {
         let mut files = Vec::new();
         let mut directories = Vec::new();
         list_directory_fd(
-            self.root_fd.as_raw_fd(),
+            self.root_fd.platform_handle(),
             Path::new(""),
             &mut files,
             &mut directories,
@@ -1173,14 +1136,29 @@ impl NotebookStore {
         // Preferences are optional and untrusted. Bound reads and revalidate
         // the notebook through the same descriptor-based file boundary.
         let recent: RecentNotebook = serde_json::from_reader(file.take(8192)).ok()?;
-        let path = validate_relative_path(recent.path.as_deref()?).ok()?;
+        let identifier = recent.path.as_deref()?;
+        if identifier.contains("://") {
+            return validate_duckdb_ui_identifier(identifier).ok();
+        }
+        let path = validate_relative_path(identifier).ok()?;
         self.read(&path).ok()?;
         slash_path(&path).ok()
     }
 
+    #[cfg(test)]
     fn remember(&self, path: &Path) -> Result<String, ApiError> {
         self.read(path)?;
-        let path = slash_path(path)?;
+        self.remember_identifier(&slash_path(path)?)
+    }
+
+    fn remember_identifier(&self, identifier: &str) -> Result<String, ApiError> {
+        let path = if identifier.contains("://") {
+            validate_duckdb_ui_identifier(identifier)?
+        } else {
+            let path = validate_relative_path(identifier)?;
+            self.read(&path)?;
+            slash_path(&path)?
+        };
         let destination = self.recent_path.as_ref().ok_or_else(|| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1202,12 +1180,7 @@ impl NotebookStore {
             )
         })?;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)
-                .map_err(file_io)?;
+            let mut file = private_new_file(&temporary).map_err(file_io)?;
             file.write_all(&bytes).map_err(file_io)?;
             file.sync_all().map_err(file_io)?;
             fs::rename(&temporary, destination).map_err(file_io)
@@ -1276,15 +1249,26 @@ impl NotebookStore {
                 "file lock is poisoned",
             )
         })?;
+        self.write_locked(relative, source, expected, reason)
+    }
+
+    // Caller holds writes, including when copying a revision into a new file.
+    fn write_locked(
+        &self,
+        relative: &Path,
+        source: &[u8],
+        expected: &str,
+        reason: &str,
+    ) -> Result<String, ApiError> {
         let mut history = self.history.lock()?;
         history.finish(true)?;
         let history_path = slash_path(relative)?;
         let mut baseline = None;
         let (parent, name) = self.open_parent(relative, true)?;
-        let current = open_file_at(parent.as_raw_fd(), &name);
+        let current = open_file_at(parent.platform_handle(), &name);
         match (expected.is_empty(), current) {
             (true, Ok(_)) => return Err(conflict("file already exists")),
-            (true, Err(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            (true, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             (true, Err(error)) => return Err(file_io(error)),
             (false, Ok(file)) => {
                 let metadata = file.metadata().map_err(file_io)?;
@@ -1300,7 +1284,7 @@ impl NotebookStore {
                 }
                 baseline = Some(bytes);
             }
-            (false, Err(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
+            (false, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(conflict("file no longer exists"))
             }
             (false, Err(error)) => return Err(file_io(error)),
@@ -1313,10 +1297,10 @@ impl NotebookStore {
         }
         history.prepare(&history_path, source, reason, None)?;
         let written =
-            atomic_write_at(parent.as_raw_fd(), &name, source, expected).map_err(|error| {
-                if error.raw_os_error() == Some(libc::EEXIST) {
+            atomic_write_at(parent.platform_handle(), &name, source, expected).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
                     conflict("file already exists")
-                } else if error.raw_os_error() == Some(libc::EBUSY) {
+                } else if error.kind() == std::io::ErrorKind::ResourceBusy {
                     conflict("file changed since it was opened")
                 } else {
                     file_io(error)
@@ -1338,6 +1322,47 @@ impl NotebookStore {
         Ok(revision(source))
     }
 
+    fn duplicate_file(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected: &str,
+    ) -> Result<String, ApiError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| file_io(std::io::Error::other("file lock poisoned")))?;
+        let (content, current) = self.read(source)?;
+        if expected.is_empty() || current != expected {
+            return Err(conflict("file changed since it was opened"));
+        }
+        self.write_locked(destination, content.as_bytes(), "", "duplicate")
+    }
+
+    fn delete_file(&self, relative: &Path, expected: &str) -> Result<(), ApiError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| file_io(std::io::Error::other("file lock poisoned")))?;
+        let mut history = self.history.lock()?;
+        history.finish(true)?;
+        let (content, current) = self.read(relative)?;
+        if expected.is_empty() || current != expected {
+            return Err(conflict("file changed since it was opened"));
+        }
+        let (parent, name) = self.open_parent(relative, false)?;
+        history.capture(&slash_path(relative)?, content.as_bytes(), "baseline")?;
+        // As with save, recheck immediately before the filesystem mutation.
+        // Portable filesystems cannot CAS against non-cooperating external writers.
+        if self.read(relative)?.1 != expected {
+            return Err(conflict("file changed since it was opened"));
+        }
+        remove_file_at(parent.platform_handle(), &name).map_err(file_io)?;
+        // Deletion has committed; don't report it as failed on directory fsync.
+        let _ = sync_directory(parent.platform_handle());
+        Ok(())
+    }
+
     fn create_folder(&self, relative: &Path) -> Result<(), ApiError> {
         let _guard = self.writes.lock().map_err(|_| {
             ApiError::new(
@@ -1347,10 +1372,8 @@ impl NotebookStore {
             )
         })?;
         let (parent, name) = self.open_parent(relative, true)?;
-        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
-        if created != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
+        if let Err(error) = create_directory_at(parent.platform_handle(), &name) {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "already_exists",
@@ -1359,9 +1382,7 @@ impl NotebookStore {
             }
             return Err(file_io(error));
         }
-        if unsafe { libc::fsync(parent.as_raw_fd()) } != 0 {
-            return Err(file_io(std::io::Error::last_os_error()));
-        }
+        sync_directory(parent.platform_handle()).map_err(file_io)?;
         Ok(())
     }
 
@@ -1382,8 +1403,8 @@ impl NotebookStore {
         history.finish(true)?;
         let (source_parent, source_name) = self.open_parent(source, false)?;
         let source_file =
-            open_file_at(source_parent.as_raw_fd(), &source_name).map_err(|error| {
-                if error.raw_os_error() == Some(libc::ENOENT) {
+            open_file_at(source_parent.platform_handle(), &source_name).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
                     ApiError::new(
                         StatusCode::NOT_FOUND,
                         "not_found",
@@ -1394,6 +1415,7 @@ impl NotebookStore {
                 }
             })?;
         let source_metadata = source_file.metadata().map_err(file_io)?;
+        let source_identity = file_identity(&source_file).map_err(file_io)?;
         if !source_metadata.is_file() || source_metadata.len() > MAX_NOTEBOOK_BYTES as u64 {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1425,11 +1447,8 @@ impl NotebookStore {
         // parent to exist. The move endpoint never creates directory state.
         let (destination_parent, destination_name) = self.open_parent(destination, false)?;
         let current_metadata =
-            metadata_at(source_parent.as_raw_fd(), &source_name).map_err(file_io)?;
-        if current_metadata.st_dev as u64 != source_metadata.dev()
-            || current_metadata.st_ino as u64 != source_metadata.ino()
-            || (current_metadata.st_mode & libc::S_IFMT) != libc::S_IFREG
-        {
+            metadata_at(source_parent.platform_handle(), &source_name).map_err(file_io)?;
+        if current_metadata != source_identity || !current_metadata.regular {
             return Err(conflict("file changed while it was being moved"));
         }
         let source_path = slash_path(source)?;
@@ -1437,18 +1456,20 @@ impl NotebookStore {
         history.capture(&source_path, &bytes, "baseline")?;
         history.prepare(&source_path, &bytes, "rename", Some(&destination_path))?;
         let moved = rename_no_replace(
-            source_parent.as_raw_fd(),
+            source_parent.platform_handle(),
             &source_name,
-            destination_parent.as_raw_fd(),
+            destination_parent.platform_handle(),
             &destination_name,
         )
-        .map_err(|error| match error.raw_os_error() {
-            Some(libc::EEXIST) | Some(libc::ENOTEMPTY) => ApiError::new(
-                StatusCode::CONFLICT,
-                "already_exists",
-                "destination already exists",
-            ),
-            Some(libc::ENOENT) => conflict("file changed while it was being moved"),
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty => {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "already_exists",
+                    "destination already exists",
+                )
+            }
+            std::io::ErrorKind::NotFound => conflict("file changed while it was being moved"),
             _ => file_io(error),
         });
         if let Err(error) = moved {
@@ -1459,15 +1480,15 @@ impl NotebookStore {
         // The rename is already committed at this point. Directory fsync is
         // best-effort: reporting an error would make the client believe the
         // source path still exists and leave its active document stale.
-        let _ = unsafe { libc::fsync(source_parent.as_raw_fd()) };
-        let _ = unsafe { libc::fsync(destination_parent.as_raw_fd()) };
+        let _ = sync_directory(source_parent.platform_handle());
+        let _ = sync_directory(destination_parent.platform_handle());
         Ok(source_revision)
     }
 
     fn open_file(&self, relative: &Path) -> Result<File, ApiError> {
         let (parent, name) = self.open_parent(relative, false)?;
-        open_file_at(parent.as_raw_fd(), &name).map_err(|error| {
-            if error.raw_os_error() == Some(libc::ENOENT) {
+        open_file_at(parent.platform_handle(), &name).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
                 ApiError::new(
                     StatusCode::NOT_FOUND,
                     "not_found",
@@ -1479,33 +1500,43 @@ impl NotebookStore {
         })
     }
 
-    fn open_parent(&self, relative: &Path, create: bool) -> Result<(OwnedFd, CString), ApiError> {
+    fn open_parent(&self, relative: &Path, create: bool) -> Result<(File, CString), ApiError> {
         let mut components: Vec<_> = relative.components().collect();
         let name = match components.pop() {
             Some(Component::Normal(name)) => cstring_component(name)?,
             _ => return Err(invalid_path()),
         };
-        let duplicated = unsafe { libc::dup(self.root_fd.as_raw_fd()) };
-        if duplicated < 0 {
-            return Err(file_io(std::io::Error::last_os_error()));
-        }
-        let mut directory = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        let mut directory = self.root_fd.try_clone().map_err(file_io)?;
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(invalid_path());
             };
             let name = cstring_component(name)?;
-            match open_directory_at(directory.as_raw_fd(), &name) {
+            match open_directory_at(directory.platform_handle(), &name) {
                 Ok(next) => directory = next,
-                Err(error) if create && error.raw_os_error() == Some(libc::ENOENT) => {
-                    mkdir_at(directory.as_raw_fd(), &name).map_err(file_io)?;
-                    directory = open_directory_at(directory.as_raw_fd(), &name).map_err(file_io)?;
+                Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                    mkdir_at(directory.platform_handle(), &name).map_err(file_io)?;
+                    directory =
+                        open_directory_at(directory.platform_handle(), &name).map_err(file_io)?;
                 }
                 Err(error) => return Err(file_io(error)),
             }
         }
         Ok((directory, name))
     }
+}
+
+// Source identifiers are permitted only in the recent preference, never in
+// filesystem operations. Require the canonical hyphenated UUID spelling.
+fn validate_duckdb_ui_identifier(value: &str) -> Result<String, ApiError> {
+    let id = value
+        .strip_prefix("duckdb-ui://")
+        .ok_or_else(invalid_path)?;
+    let parsed = uuid::Uuid::parse_str(id).map_err(|_| invalid_path())?;
+    if parsed.hyphenated().to_string() != id {
+        return Err(invalid_path());
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_relative_path(value: &str) -> Result<PathBuf, ApiError> {
@@ -1534,7 +1565,7 @@ fn validate_relative_components(value: &str) -> Result<PathBuf, ApiError> {
     if path.is_absolute()
         || !path
             .components()
-            .all(|component| matches!(component, Component::Normal(name) if !name.as_encoded_bytes().eq_ignore_ascii_case(b".git")))
+            .all(|component| matches!(component, Component::Normal(name) if valid_component(name)))
     {
         return Err(invalid_path());
     }
@@ -1587,295 +1618,6 @@ fn slash_path(path: &Path) -> Result<String, ApiError> {
         })
         .collect();
     Ok(parts?.join("/"))
-}
-
-fn cstring_component(value: &std::ffi::OsStr) -> Result<CString, ApiError> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(value.as_bytes()).map_err(|_| invalid_path())
-}
-
-struct DirectoryStream(*mut libc::DIR);
-
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        unsafe {
-            libc::closedir(self.0);
-        }
-    }
-}
-
-fn list_directory_fd(
-    directory: libc::c_int,
-    relative: &Path,
-    files: &mut Vec<FileEntry>,
-    directories: &mut Vec<String>,
-) -> Result<(), ApiError> {
-    let dot = c".";
-    // openat(".") creates an independent open file description. dup would
-    // share the directory offset and make a second listing appear empty.
-    let reopened = open_directory_at(directory, dot).map_err(file_io)?;
-    let reopened = reopened.into_raw_fd();
-    let stream = unsafe { libc::fdopendir(reopened) };
-    if stream.is_null() {
-        unsafe { libc::close(reopened) };
-        return Err(file_io(std::io::Error::last_os_error()));
-    }
-    let stream = DirectoryStream(stream);
-    loop {
-        clear_errno();
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error = current_errno();
-            if error != 0 {
-                return Err(file_io(std::io::Error::from_raw_os_error(error)));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() == b"."
-            || name.to_bytes() == b".."
-            || name.to_bytes().eq_ignore_ascii_case(b".git")
-        {
-            continue;
-        }
-        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::fstatat(
-                directory,
-                name.as_ptr(),
-                &mut metadata,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(file_io(std::io::Error::last_os_error()));
-        }
-        let kind = metadata.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFLNK {
-            continue;
-        }
-        let file_name = std::ffi::OsString::from_vec(name.to_bytes().to_vec());
-        let child_relative = relative.join(file_name);
-        if kind == libc::S_IFDIR {
-            let child_name = CString::new(name.to_bytes()).map_err(|_| invalid_path())?;
-            let child = open_directory_at(directory, &child_name).map_err(file_io)?;
-            if let Ok(path) = slash_path(&child_relative) {
-                directories.push(path);
-            }
-            list_directory_fd(child.as_raw_fd(), &child_relative, files, directories)?;
-        } else if kind == libc::S_IFREG && allowed_extension(&child_relative) {
-            if let Ok(path) = slash_path(&child_relative) {
-                files.push(FileEntry { path });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn clear_errno() {
-    unsafe { *libc::__error() = 0 }
-}
-
-#[cfg(target_os = "macos")]
-fn current_errno() -> i32 {
-    unsafe { *libc::__error() }
-}
-
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    unsafe { *libc::__errno_location() = 0 }
-}
-
-#[cfg(target_os = "linux")]
-fn current_errno() -> i32 {
-    unsafe { *libc::__errno_location() }
-}
-
-fn open_directory(path: &Path) -> std::io::Result<OwnedFd> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-}
-
-fn open_directory_at(parent: libc::c_int, name: &CStr) -> std::io::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-}
-
-fn mkdir_at(parent: libc::c_int, name: &CStr) -> std::io::Result<()> {
-    let result = unsafe { libc::mkdirat(parent, name.as_ptr(), 0o755) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn open_file_at(parent: libc::c_int, name: &CStr) -> std::io::Result<File> {
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn metadata_at(parent: libc::c_int, name: &CStr) -> std::io::Result<libc::stat> {
-    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::fstatat(
-            parent,
-            name.as_ptr(),
-            &mut metadata,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        Ok(metadata)
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn rename_no_replace(
-    source_parent: libc::c_int,
-    source_name: &CStr,
-    destination_parent: libc::c_int,
-    destination_name: &CStr,
-) -> std::io::Result<()> {
-    let result = unsafe {
-        libc::renameatx_np(
-            source_parent,
-            source_name.as_ptr(),
-            destination_parent,
-            destination_name.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rename_no_replace(
-    source_parent: libc::c_int,
-    source_name: &CStr,
-    destination_parent: libc::c_int,
-    destination_name: &CStr,
-) -> std::io::Result<()> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            source_parent,
-            source_name.as_ptr(),
-            destination_parent,
-            destination_name.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn atomic_write_at(
-    parent: libc::c_int,
-    name: &CStr,
-    source: &[u8],
-    expected_revision: &str,
-) -> std::io::Result<()> {
-    let temporary = CString::new(format!(".sidequery-{}.tmp", uuid::Uuid::new_v4()))
-        .expect("UUID contains no NUL");
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            temporary.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = (|| {
-        file.write_all(source)?;
-        file.sync_all()?;
-        if expected_revision.is_empty() {
-            let linked =
-                unsafe { libc::linkat(parent, temporary.as_ptr(), parent, name.as_ptr(), 0) };
-            if linked != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let _ = unsafe { libc::unlinkat(parent, temporary.as_ptr(), 0) };
-        } else {
-            // Recheck after the temporary file is durable, immediately before
-            // replacement. Portable filesystems do not expose a cross-process
-            // compare-and-swap rename, so a non-cooperating writer can still
-            // race the final rename after this check.
-            let current = open_file_at(parent, name)?;
-            let metadata = current.metadata()?;
-            if !metadata.is_file() || metadata.len() > MAX_NOTEBOOK_BYTES as u64 {
-                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            current
-                .take((MAX_NOTEBOOK_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > MAX_NOTEBOOK_BYTES || revision(&bytes) != expected_revision {
-                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            let renamed =
-                unsafe { libc::renameat(parent, temporary.as_ptr(), parent, name.as_ptr()) };
-            if renamed != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        let synced = unsafe { libc::fsync(parent) };
-        if synced != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = unsafe { libc::unlinkat(parent, temporary.as_ptr(), 0) };
-    }
-    result
 }
 
 async fn security_middleware(
@@ -2273,9 +2015,8 @@ async fn put_recent_notebook(
     Json(body): Json<FileQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&headers, &state)?;
-    let path = validate_relative_path(&body.path)?;
     let notebooks = state.notebooks.clone();
-    let path = tokio::task::spawn_blocking(move || notebooks.remember(&path))
+    let path = tokio::task::spawn_blocking(move || notebooks.remember_identifier(&body.path))
         .await
         .map_err(|_| {
             ApiError::new(
@@ -2363,6 +2104,39 @@ async fn put_file(
         path: slash_path(&path)?,
         revision,
     }))
+}
+
+async fn duplicate_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DuplicateFileRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let source = validate_relative_path(&body.path)?;
+    let destination = validate_relative_path(&body.destination_path)?;
+    let path = slash_path(&destination)?;
+    let notebooks = state.notebooks.clone();
+    let revision = tokio::task::spawn_blocking(move || {
+        notebooks.duplicate_file(&source, &destination, &body.expected_revision)
+    })
+    .await
+    .map_err(|_| file_io(std::io::Error::other("file task failed")))??;
+    Ok(Json(PutFileResponse { path, revision }))
+}
+
+async fn delete_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteFileRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&headers, &state)?;
+    let relative = validate_relative_path(&body.path)?;
+    let path = slash_path(&relative)?;
+    let notebooks = state.notebooks.clone();
+    tokio::task::spawn_blocking(move || notebooks.delete_file(&relative, &body.expected_revision))
+        .await
+        .map_err(|_| file_io(std::io::Error::other("file task failed")))??;
+    Ok(Json(CreateFolderResponse { path }))
 }
 
 async fn move_file(
@@ -2520,8 +2294,12 @@ fn router(state: AppState) -> Router {
             "/api/v1/recent-notebook",
             get(get_recent_notebook).put(put_recent_notebook),
         )
-        .route("/api/v1/file", get(get_file).put(put_file))
+        .route(
+            "/api/v1/file",
+            get(get_file).put(put_file).delete(delete_file),
+        )
         .route("/api/v1/file/move", post(move_file))
+        .route("/api/v1/file/duplicate", post(duplicate_file))
         .route("/api/v1/folder", post(create_folder))
         .route("/quack", post(quack).options(options_quack));
     if !state.mcp_token.is_empty() {
@@ -2663,6 +2441,50 @@ fn set_error(error_out: *mut *mut c_char, message: String) {
     let value = CString::new(sanitized).expect("sanitized string contains no NUL");
     unsafe {
         *error_out = value.into_raw();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sidequery_duckdb_ui_next_version(
+    previous: *const c_char,
+    edited: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| -> Result<CString, String> {
+        if edited.is_null() {
+            return Err("DuckDB UI notebook JSON must not be null".into());
+        }
+        let previous = if previous.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(previous) }
+                    .to_str()
+                    .map_err(|_| "DuckDB UI notebook JSON must be UTF-8")?,
+            )
+        };
+        let edited = unsafe { CStr::from_ptr(edited) }
+            .to_str()
+            .map_err(|_| "DuckDB UI notebook JSON must be UTF-8")?;
+        CString::new(match previous {
+            Some(previous) => duckdb_ui::next_version(previous, edited)?,
+            None => duckdb_ui::initial_version(edited)?,
+        })
+        .map_err(|_| "DuckDB UI notebook JSON contains NUL".into())
+    });
+    match result {
+        Ok(Ok(json)) => json.into_raw(),
+        Ok(Err(error)) => {
+            set_error(error_out, error);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_error(
+                error_out,
+                "Unexpected error validating a DuckDB UI notebook".into(),
+            );
+            ptr::null_mut()
+        }
     }
 }
 

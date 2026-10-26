@@ -447,7 +447,7 @@ impl ProjectGit {
             );
         }
         let meta = fs::symlink_metadata(&self.root).map_err(|_| "Cannot inspect notebook root")?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
+        if !meta.is_dir() || crate::platform::is_reparse(&meta) {
             return Err("Notebook root must be a real directory".into());
         }
         checked(&self.root, None, &["init", "--", "."], None)?;
@@ -475,9 +475,9 @@ impl ProjectGit {
             || path
                 .split('/')
                 .any(|part| matches!(part, "" | "." | ".." | ".git"))
-            || relative
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_)))
+            || relative.components().any(
+                |c| !matches!(c, Component::Normal(name) if crate::platform::valid_component(name)),
+            )
             || !matches!(
                 relative.extension().and_then(|s| s.to_str()),
                 Some("sql" | "sqlnb")
@@ -489,7 +489,7 @@ impl ProjectGit {
         for component in relative.components() {
             current.push(component);
             match fs::symlink_metadata(&current) {
-                Ok(meta) if meta.file_type().is_symlink() => {
+                Ok(meta) if crate::platform::is_reparse(&meta) => {
                     return Err("Symlink notebook paths are not allowed".into())
                 }
                 Ok(meta) if current == self.root.join(relative) && !meta.is_file() => {
@@ -498,7 +498,11 @@ impl ProjectGit {
                 Ok(meta) if current != self.root.join(relative) && !meta.is_dir() => {
                     return Err("Notebook parent must be a directory".into())
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    #[cfg(windows)]
+                    crate::platform::validate_existing_component(&current)
+                        .map_err(|_| "Notebook path resolves to a reserved component")?;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err("Cannot inspect notebook path".into()),
             }
@@ -508,12 +512,9 @@ impl ProjectGit {
 }
 
 fn repo_path(repo: &Repository, path: &str) -> Result<String, String> {
-    repo.prefix
-        .join(path)
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "Git path must be UTF-8".into())
+    crate::slash_path(&repo.prefix.join(path)).map_err(|_| "Git path must be UTF-8".into())
 }
+
 fn line(bytes: &[u8]) -> Result<String, String> {
     Ok(std::str::from_utf8(bytes)
         .map_err(|_| "Git response must be UTF-8")?
@@ -705,6 +706,7 @@ fn bounded_read(
                 continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) if finished.load(Ordering::Acquire) => break,
             Err(error) => return Err(error),
         };
         if count == 0 {
@@ -785,6 +787,11 @@ fn run_with_timeout(
             });
         }
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    }
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "Git executable is unavailable".to_owned()
@@ -792,6 +799,9 @@ fn run_with_timeout(
             "Cannot start Git".to_owned()
         }
     })?;
+    #[cfg(windows)]
+    let job = crate::windows_process::Job::contain_and_resume(&mut child)
+        .map_err(|_| "Cannot contain Git subprocess")?;
     let stdout = child.stdout.take().ok_or("Cannot read Git output")?;
     let stderr = child.stderr.take().ok_or("Cannot read Git output")?;
     let mut stdin = child.stdin.take().ok_or("Cannot write Git input")?;
@@ -838,6 +848,8 @@ fn run_with_timeout(
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
+                #[cfg(windows)]
+                job.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -851,7 +863,15 @@ fn run_with_timeout(
     }
     // A daemonized helper can escape the process group. Nonblocking pipes and
     // this completion flag keep its inherited descriptors from hanging joins.
+    #[cfg(windows)]
+    job.terminate();
     finished.store(true, Ordering::Release);
+    #[cfg(windows)]
+    {
+        crate::windows_process::cancel_pipe_worker(&out_thread);
+        crate::windows_process::cancel_pipe_worker(&err_thread);
+        crate::windows_process::cancel_pipe_worker(&input_thread);
+    }
     let bytes = out_thread
         .join()
         .map_err(|_| "Cannot read Git output")?

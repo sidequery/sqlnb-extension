@@ -5,7 +5,19 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::os::unix::fs::symlink;
+#[cfg(unix)]
+pub(crate) use std::os::unix::fs::symlink;
+#[cfg(windows)]
+pub(crate) fn symlink(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    if source.as_ref().is_dir() {
+        std::os::windows::fs::symlink_dir(source, destination)
+    } else {
+        std::os::windows::fs::symlink_file(source, destination)
+    }
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -518,7 +530,7 @@ fn remote_asset_cache_leases_bound_gc_without_deleting_pinned_generations() {
         .write(true)
         .open(v1_path.join(ASSET_LEASE_FILE))
         .unwrap();
-    assert!(!try_lock_file(&lease_probe, libc::LOCK_EX, "test lease").unwrap());
+    assert!(!try_lock_file(&lease_probe, LOCK_EX, "test lease").unwrap());
     assert!(v1_path.exists() && v2_path.exists() && v3_path.exists());
     drop(lease_probe);
 
@@ -1630,4 +1642,167 @@ async fn mcp_contract_rejects_legacy_names_invalid_arguments_and_ambiguous_targe
     let response = app.oneshot(fixture.request("POST", "/api/v1/mcp/browser/result", Some(serde_json::json!({"session_id":"first","request_id":command["request_id"],"result":acknowledgment})))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(task.await.unwrap().unwrap(), acknowledgment);
+}
+
+#[tokio::test]
+async fn notebook_lifecycle_preserves_whole_source_and_checks_revisions() {
+    let fixture = Fixture::new();
+    let source = "-- notebook metadata\n-- @a [First]\nselect 1;\n-- @b [Second]\nselect 2;\n";
+    fs::write(fixture.root.join("original.sqlnb"), source).unwrap();
+    let app = router(fixture.state.clone());
+    let expected = revision(source.as_bytes());
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "POST",
+            "/api/v1/file/duplicate",
+            Some(json!({
+                "path":"original.sqlnb", "destinationPath":"copy.sqlnb", "expectedRevision":expected
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("copy.sqlnb")).unwrap(),
+        source
+    );
+    for revision in ["stale", ""] {
+        let response = app
+            .clone()
+            .oneshot(fixture.request(
+                "DELETE",
+                "/api/v1/file",
+                Some(json!({
+                    "path":"copy.sqlnb", "expectedRevision":revision
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "POST",
+            "/api/v1/file/duplicate",
+            Some(json!({
+                "path":"original.sqlnb", "destinationPath":"copy.sqlnb", "expectedRevision":expected
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .oneshot(fixture.request(
+            "DELETE",
+            "/api/v1/file",
+            Some(json!({
+                "path":"copy.sqlnb", "expectedRevision":expected
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!fixture.root.join("copy.sqlnb").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("original.sqlnb")).unwrap(),
+        source
+    );
+    assert!(!fixture
+        .state
+        .notebooks
+        .history
+        .lock()
+        .unwrap()
+        .list("copy.sqlnb")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn notebook_lifecycle_rejects_symlinks_traversal_and_unauthenticated_deletes() {
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("protected.sql"), "select 1;").unwrap();
+    symlink(
+        outside.path().join("protected.sql"),
+        fixture.root.join("link.sql"),
+    )
+    .unwrap();
+    let app = router(fixture.state.clone());
+    for path in ["link.sql", "../protected.sql"] {
+        let response = app
+            .clone()
+            .oneshot(fixture.request(
+                "DELETE",
+                "/api/v1/file",
+                Some(json!({
+                    "path":path,"expectedRevision":revision(b"select 1;")
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(fixture.request("POST", "/api/v1/file/duplicate", Some(json!({
+            "path":path,"destinationPath":"copy.sql","expectedRevision":revision(b"select 1;")
+        })))).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+    fs::write(fixture.root.join("protected.sql"), "select 1;").unwrap();
+    let mut request = fixture.request(
+        "DELETE",
+        "/api/v1/file",
+        Some(json!({"path":"protected.sql","expectedRevision":revision(b"select 1;")})),
+    );
+    request.headers_mut().remove(header::AUTHORIZATION);
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(fixture.root.join("protected.sql").exists());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("protected.sql")).unwrap(),
+        "select 1;"
+    );
+}
+
+#[tokio::test]
+async fn recent_duckdb_ui_identifier_survives_reopen_without_filesystem_access() {
+    let fixture = Fixture::new();
+    let identifier = "duckdb-ui://b7af9310-8cb8-4224-8e84-7db9548362fb";
+    let app = router(fixture.state.clone());
+    let response = app
+        .clone()
+        .oneshot(fixture.request(
+            "PUT",
+            "/api/v1/recent-notebook",
+            Some(json!({"path":identifier})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reopened = NotebookStore::open(fixture.root.clone()).unwrap();
+    reopened.recent_path = fixture.state.notebooks.recent_path.clone();
+    assert_eq!(reopened.recent().as_deref(), Some(identifier));
+    for invalid in [
+        "https://example.com",
+        "duckdb-ui://../file.sql",
+        "duckdb-ui://b7af9310-8cb8-4224-8e84-7db9548362fb/extra",
+        "duckdb-ui://b7af93108cb842248e847db9548362fb",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(fixture.request(
+                "PUT",
+                "/api/v1/recent-notebook",
+                Some(json!({"path":invalid})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(reopened.recent().as_deref(), Some(identifier));
+    }
+    let response = app
+        .oneshot(fixture.request("GET", &format!("/api/v1/file?path={identifier}"), None))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
 }
