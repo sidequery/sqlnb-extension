@@ -21,10 +21,13 @@ set(SIDEQUERY_HTTP_LOCK ${CMAKE_CURRENT_SOURCE_DIR}/http/Cargo.lock)
 file(GLOB_RECURSE SIDEQUERY_HTTP_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/http/src/*.rs)
 set(SIDEQUERY_HTTP_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/http-cargo)
-if(NOT UNIX)
-  message(FATAL_ERROR "SQLNB's local notebook server currently supports macOS and Linux")
+if(MSVC)
+  set(SIDEQUERY_HTTP_LIBRARY ${SIDEQUERY_HTTP_TARGET_DIR}/release/sidequery_http.lib)
+  # DuckDB uses the static MSVC runtime; Rust and its C dependencies must agree.
+  set(SIDEQUERY_RUST_ENV "RUSTFLAGS=$ENV{RUSTFLAGS} -C target-feature=+crt-static")
+else()
+  set(SIDEQUERY_HTTP_LIBRARY ${SIDEQUERY_HTTP_TARGET_DIR}/release/libsidequery_http.a)
 endif()
-set(SIDEQUERY_HTTP_LIBRARY ${SIDEQUERY_HTTP_TARGET_DIR}/release/libsidequery_http.a)
 
 set(SIDEQUERY_REPO_MBX ${CMAKE_CURRENT_SOURCE_DIR}/scripts/mbx)
 if(EXISTS ${SIDEQUERY_REPO_MBX})
@@ -46,7 +49,7 @@ endif()
 
 add_custom_command(
   OUTPUT ${SIDEQUERY_HTTP_LIBRARY}
-  COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${SIDEQUERY_HTTP_TARGET_DIR}
+  COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${SIDEQUERY_HTTP_TARGET_DIR} ${SIDEQUERY_RUST_ENV}
           ${SIDEQUERY_CARGO_BUILD} --manifest-path ${SIDEQUERY_HTTP_MANIFEST} --locked --release
   DEPENDS ${SIDEQUERY_HTTP_MANIFEST} ${SIDEQUERY_HTTP_LOCK} ${SIDEQUERY_HTTP_SOURCES}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/http
@@ -67,6 +70,8 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
     target_link_libraries(${target} iconv)
   elseif(UNIX)
     target_link_libraries(${target} rt util m)
+  elseif(WIN32)
+    target_link_libraries(${target} ws2_32 userenv bcrypt ntdll crypt32 secur32 shell32 advapi32 winhttp rpcrt4 ole32)
   endif()
 endforeach()
 

@@ -2,6 +2,12 @@
 #ifndef _WIN32
 #include <spawn.h>
 #include <sys/wait.h>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
 #endif
 
 #include "sidequery_ui_extension.hpp"
@@ -13,6 +19,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -29,6 +36,7 @@
 #if __has_include("duckdb/main/query_result_stream.hpp")
 #include "duckdb/main/query_result_stream.hpp"
 #define SQLNB_HAS_RESULT_STREAM 1
+#include "sqlnb_read_policy.hpp"
 #endif
 
 #if __has_include("duckdb/main/extension_repository_manager.hpp")
@@ -50,11 +58,6 @@
 #ifndef _WIN32
 extern char **environ;
 #endif
-#ifdef _WIN32
-#include <shellapi.h>
-#include <windows.h>
-#endif
-
 namespace duckdb {
 namespace {
 
@@ -87,6 +90,8 @@ static string JSONEscape(const string &value) {
   out << '"';
   return out.str();
 }
+
+#include "duckdb_ui_notebooks.hpp"
 
 static string RandomHex(idx_t bytes) {
   vector<unsigned char> random(bytes);
@@ -762,6 +767,10 @@ static void StopFunction(DataChunk &, ExpressionState &state, Vector &result) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+  RegisterDuckDBUINotebooks(loader);
+#ifdef SQLNB_HAS_RESULT_STREAM
+  RegisterSQLNBReadPolicy(loader);
+#endif
   auto state_extension = make_shared_ptr<StorageExtension>();
   state_extension->storage_info = make_uniq<SqlnbState>();
   StorageExtension::Register(loader.GetDatabaseInstance().config, SQLNB_STATE_KEY,
