@@ -10,8 +10,9 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+            FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
         },
     },
     Win32::{
@@ -121,6 +122,16 @@ fn wide_component(name: &CStr) -> Result<Vec<u16>> {
 // the point itself, and checking that handle rejects junctions and every other tag.
 fn open_at(parent: HANDLE, name: &CStr, access: u32, disposition: u32, kind: u32) -> Result<File> {
     let mut wide = wide_component(name)?;
+    open_relative(parent, &mut wide, access, disposition, kind)
+}
+
+fn open_relative(
+    parent: HANDLE,
+    wide: &mut [u16],
+    access: u32,
+    disposition: u32,
+    kind: u32,
+) -> Result<File> {
     let mut unicode = UNICODE_STRING {
         Length: (wide.len() * 2) as u16,
         MaximumLength: (wide.len() * 2) as u16,
@@ -175,6 +186,19 @@ pub(crate) fn open_directory_at(parent: HANDLE, name: &CStr) -> Result<File> {
         FILE_DIRECTORY_FILE,
     )
 }
+
+fn reopen_directory(directory: HANDLE) -> Result<File> {
+    // NT paths do not interpret "." as Win32 paths do. An empty relative name
+    // reopens this exact directory with an independent enumeration cursor.
+    // Keep empty names private to this operation, not caller-supplied paths.
+    open_relative(
+        directory,
+        &mut [],
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    )
+}
 pub(crate) fn open_file_at(parent: HANDLE, name: &CStr) -> Result<File> {
     open_at(
         parent,
@@ -222,24 +246,29 @@ pub(crate) fn metadata_at(parent: HANDLE, name: &CStr) -> Result<FileIdentity> {
 }
 fn rename_handle(file: &File, destination: HANDLE, name: &CStr, replace: bool) -> Result<()> {
     let wide = wide_component(name)?;
-    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let size = offset + wide.len() * 2;
+    let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
     // A u64 allocation supplies the structure's required alignment.
     let mut storage = vec![0u64; size.div_ceil(8)];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut status = IO_STATUS_BLOCK::default();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = destination;
         (*info).FileNameLength = (wide.len() * 2) as u32;
         ptr::copy_nonoverlapping(wide.as_ptr(), (*info).FileName.as_mut_ptr(), wide.len());
-        if SetFileInformationByHandle(
+        // Use the native directory-relative rename contract, matching NtCreateFile.
+        // Resolving a pathname here would lose the pinned-parent boundary.
+        let result = NtSetInformationFile(
             file.platform_handle(),
-            FileRenameInfo,
+            &mut status,
             info.cast(),
             size as u32,
-        ) == 0
-        {
-            return Err(Error::last_os_error());
+            FileRenameInformation,
+        );
+        if result < 0 {
+            return Err(Error::from_raw_os_error(
+                RtlNtStatusToDosError(result) as i32
+            ));
         }
     }
     Ok(())
@@ -330,7 +359,7 @@ pub(crate) fn list_directory_fd(
     files: &mut Vec<FileEntry>,
     directories: &mut Vec<String>,
 ) -> std::result::Result<(), ApiError> {
-    let directory = open_directory_at(directory, c".").map_err(file_io)?;
+    let directory = reopen_directory(directory).map_err(file_io)?;
     let mut storage = vec![0u64; 8192];
     let mut first = true;
     loop {
@@ -537,6 +566,59 @@ mod tests {
             b"select 1"
         );
         assert!(!outside.join("test.sql").exists());
+
+        let revision = revision(b"select 1");
+        atomic_write_at(
+            parent.platform_handle(),
+            c"test.sql",
+            b"select 2",
+            &revision,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("original/test.sql")).unwrap(),
+            b"select 2"
+        );
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        list_directory_fd(
+            parent.platform_handle(),
+            Path::new(""),
+            &mut files,
+            &mut directories,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "test.sql");
+        assert!(!outside.join("test.sql").exists());
+    }
+
+    #[test]
+    fn native_write_flush_and_relative_rename_preserve_collision_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = open_directory(temp.path()).unwrap();
+        let mut file = open_at(
+            root.platform_handle(),
+            c"temporary",
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+        )
+        .expect("create a file relative to the root handle");
+        file.write_all(b"select 42;").expect("write file contents");
+        file.sync_all().expect("flush file contents");
+        rename_handle(&file, root.platform_handle(), c"π.sql", false)
+            .expect("rename relative to the root handle");
+        assert_eq!(fs::read(temp.path().join("π.sql")).unwrap(), b"select 42;");
+        drop(file);
+
+        assert_eq!(
+            atomic_write_at(root.platform_handle(), c"π.sql", b"overwrite", "")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(temp.path().join("π.sql")).unwrap(), b"select 42;");
     }
 
     #[test]

@@ -27,11 +27,13 @@ const httpfsExtension = values.get('--httpfs-extension');
 const repository = values.get('--repository');
 assert(
   duckdb && (repository || (extension && quackExtension && httpfsExtension)),
-  'usage: runtime-smoke.mjs --duckdb PATH [--repository PREFIX | --extension PATH --quack-extension PATH --httpfs-extension PATH_OR_core]',
+  'usage: runtime-smoke.mjs --duckdb PATH [--repository PREFIX | --extension PATH --quack-extension PATH_OR_core --httpfs-extension PATH_OR_core]',
 );
 if (!repository) {
   assert(statSync(extension).size > 0, `empty SQLNB extension: ${extension}`);
-  assert(statSync(quackExtension).size > 0, `empty Quack extension: ${quackExtension}`);
+  if (quackExtension !== 'core') {
+    assert(statSync(quackExtension).size > 0, `empty Quack extension: ${quackExtension}`);
+  }
   if (httpfsExtension !== 'core') {
     assert(statSync(httpfsExtension).size > 0, `empty httpfs extension: ${httpfsExtension}`);
   }
@@ -70,13 +72,17 @@ function loadExtensions(includeUI = true) {
   }
   if (repository) {
     if (includeUI) {
-      // SQLNB installs and loads its private Quack dependency from this repository.
+      // SQLNB comes from this repository; its runtime dependencies come from core.
       statements.push('install sqlnb from sidequery', 'load sqlnb from sidequery');
     } else {
-      statements.push('install quack from sidequery', 'load quack from sidequery');
+      statements.push('install quack from core', 'load quack from core');
     }
   } else {
-    statements.push(`load ${sqlLiteral(quackExtension)}`);
+    if (quackExtension !== 'core') {
+      statements.push(`load ${sqlLiteral(quackExtension)}`);
+    } else if (!includeUI) {
+      statements.push('install quack from core', 'load quack from core');
+    }
     if (includeUI) statements.push(`load ${sqlLiteral(extension)}`);
   }
   return statements.join('; ');
@@ -189,7 +195,11 @@ await expectSQLError(
   /port must be between 0 and 65535/,
 );
 assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
-assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
+if (repository || quackExtension === 'core') {
+  assert.equal(firstValue(await runSQL("select loaded from duckdb_extensions() where extension_name = 'quack'")), false);
+} else {
+  assert.equal(firstValue(await runSQL('select count(*) as count from quack_server_list()')), 0);
+}
 assert.equal(
   firstValue(await runSQL('create table shared_table as select 7::integer as value; select true')),
   true,
@@ -225,6 +235,13 @@ const startRows = await runSQL(
 const start = JSON.parse(firstValue(startRows));
 assert.equal(start.engine, 'native-duckdb');
 assert.equal(start.protocol, 'quack');
+if (repository || quackExtension === 'core') {
+  assert.equal(
+    firstValue(await runSQL("select installed_from from duckdb_extensions() where extension_name = 'quack'")),
+    'core',
+    'SQLNB must use the official core Quack',
+  );
+}
 assert.equal(
   firstValue(await runSQL("select loaded from duckdb_extensions() where extension_name = 'icu'")),
   true,
@@ -656,8 +673,10 @@ assert.match(await remoteAsset.text(), /sidequeryRemoteFixture = 'one'/);
 assert.equal((await fetch(`${remote.baseUrl}/../outside`)).status, 404);
 assert(upstreamPaths.includes('/notebook/manifest.json'));
 assert(!upstreamPaths.includes('/notebook/outside'));
-assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 release = 'two';
+// Publishing a new UI must not replace assets beneath an active notebook.
+assert.match(await (await fetch(`${remote.baseUrl}/asset.js`)).text(), /sidequeryRemoteFixture = 'one'/);
+assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
 const updatedUi = JSON.parse(firstValue(await runSQL(
   `select sqlnb_start(ui := 'http://127.0.0.1:${upstreamPort}/notebook/', open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}) as status`,
 )));

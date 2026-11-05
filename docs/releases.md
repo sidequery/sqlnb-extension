@@ -8,6 +8,29 @@ Building this repository does not require that access.
 
 Run the commands below from the repository root.
 
+## Community repository
+
+The community build uses the standard `Makefile`, `extension_config.cmake`,
+and `test/sql` suite. Its CI pins DuckDB 2.0.0 and the matching community tooling;
+it builds and tests artifacts without publishing them.
+
+Submit `extensions/sqlnb/description.yml` to
+[duckdb/community-extensions](https://github.com/duckdb/community-extensions),
+pinning `repo.ref` to a validated commit of this repository. The community
+repository builds, signs, and distributes accepted submissions. A passing build
+here does not mean the extension has been accepted or published there.
+
+After acceptance and publication, users can install with:
+
+```sql
+install sqlnb from community;
+load sqlnb;
+select sqlnb_start();
+```
+
+Quack, `httpfs`, and `icu` load from DuckDB core, including when SQLNB itself was
+installed from the Sidequery repository.
+
 ## DuckDB 2.0
 
 For official DuckDB `v2.0.0` (source `d54cbbe3df`), use the matching official CLI:
@@ -27,10 +50,10 @@ distributable standard library so Homebrew's host deployment target cannot leak
 into the extension.
 The OpenSSL build also requires Curl, Perl, and Make.
 
-Sign both artifacts using the monorepo's `tools/extension-repository` operator
+Sign the SQLNB artifact using the monorepo's `tools/extension-repository` operator
 tool. Run its signed native smoke and browser qualification before publishing
-`quack`, then `sqlnb`, to `https://extensions.sidequery.dev`. Core `httpfs` and
-`icu` remain official DuckDB dependencies and are not republished by Sidequery.
+`sqlnb` to `https://extensions.sidequery.dev`. Quack is built for local qualification;
+installed SQLNB uses the official core Quack, `httpfs`, and `icu` dependencies.
 After publication, verify a fresh signed installation:
 
 ```sh
@@ -79,5 +102,5 @@ bun scripts/runtime-smoke.mjs --duckdb /absolute/path/to/alpha41489/duckdb \
 
 A local repository directory is also accepted. Each client uses fresh extension
 and trust directories, allows only signed extensions, and proves that starting
-`sqlnb` bootstraps Quack from Sidequery. The suite checks queries, notebook files, caller
+`sqlnb` bootstraps Quack from core. The suite checks queries, notebook files, caller
 isolation, authentication, server cleanup, and remote UI generation updates.

@@ -62,9 +62,6 @@ namespace duckdb {
 namespace {
 
 static constexpr const char *DEFAULT_SQLNB_UI = "https://app.sidequery.dev/sqlnb/";
-#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
-static constexpr const char *SIDEQUERY_REPOSITORY = "sidequery";
-#endif
 
 static string JSONEscape(const string &value) {
   std::ostringstream out;
@@ -106,29 +103,6 @@ static string RandomHex(idx_t bytes) {
   return out.str();
 }
 
-static void LoadQuack(DatabaseInstance &database) {
-  if (database.ExtensionIsLoaded("quack")) {
-    return;
-  }
-#ifdef SQLNB_HAS_USER_EXTENSION_REPOSITORIES
-  auto &file_system = FileSystem::GetFileSystem(database);
-  ExtensionRepository repository;
-  if (ExtensionRepositoryManager::TryGetRepository(database, file_system, SIDEQUERY_REPOSITORY,
-                                                    repository)) {
-    ExtensionInstallOptions install_options;
-    install_options.repository = &repository;
-    install_options.throw_on_origin_mismatch = true;
-    ExtensionHelper::InstallExtension(database, file_system, "quack", install_options);
-
-    ExtensionLoadOptions load_options("quack");
-    load_options.repository = repository.name;
-    ExtensionHelper::LoadExternalExtension(database, file_system, load_options);
-    return;
-  }
-#endif
-  ExtensionHelper::AutoLoadExtension(database, "quack");
-}
-
 static void EnsureDependenciesLoaded(DatabaseInstance &database) {
   // Source-column date profiles use timezone conversion. Load ICU before
   // accepting notebook queries so their first date query never installs it.
@@ -148,11 +122,12 @@ static void EnsureDependenciesLoaded(DatabaseInstance &database) {
     throw MissingExtensionException("SQLNB requires the DuckDB httpfs extension for Quack sessions");
   }
   if (!database.ExtensionIsLoaded("quack")) {
-    LoadQuack(database);
+    // Use DuckDB's core-signed Quack regardless of where SQLNB was installed.
+    ExtensionHelper::AutoLoadExtension(database, "quack");
   }
   if (!database.ExtensionIsLoaded("quack")) {
     throw MissingExtensionException(
-        "SQLNB requires DuckDB Quack; install it from the same Sidequery extension repository");
+        "SQLNB requires DuckDB Quack; install it from core");
   }
 }
 

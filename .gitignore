@@ -1,6 +1,16 @@
 .artifacts/
 .deps/
 .agents/
+.ci/
+.cache/
+configure/
+vcpkg/
+local_vcpkg_installation/
+duckdb_downloads/
+duckdb_extensions/
+duckdb_binaries/
+testext/
+duckdb_test_dir/
 build/
 node_modules/
 test-results/
