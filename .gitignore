@@ -11,6 +11,7 @@ duckdb_extensions/
 duckdb_binaries/
 testext/
 duckdb_test_dir/
+duckdb_unittest_tempdir/
 build/
 node_modules/
 test-results/

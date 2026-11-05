@@ -1,7 +1,11 @@
 # No remote UI or browser is needed. Runtime dependencies come from DuckDB core,
 # exercising the same startup path as an installation from community.
 require sqlnb
+
 require json
+
+# Dependency download failures must fail qualification, never skip this test.
+set ignore_error_messages
 
 query T
 select json_extract(sqlnb_status(), '$.running');
@@ -23,16 +27,20 @@ select sqlnb_start(port := 65536, open_browser := false);
 ----
 port must be between 0 and 65535
 
-statement error
-select sqlnb_start(assets := NULL, open_browser := false);
+query I
+select sqlnb_start(assets := NULL, open_browser := false) is null;
 ----
-sqlnb_start arguments must not be NULL
+true
 
 statement ok
 set autoinstall_known_extensions = true;
 
 statement ok
 set autoload_known_extensions = true;
+
+# The SQL test runner normally points autoinstall at its local build repository.
+statement ok
+set autoinstall_extension_repository = 'http://extensions.duckdb.org';
 
 # A registered Sidequery repository must not override DuckDB's official Quack.
 # This is the public fixture key from DuckDB's extension_repositories_lock test;

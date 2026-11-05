@@ -15,4 +15,9 @@ if command -v mbx >/dev/null 2>&1; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${OS:-}" == Windows_NT ]]; then
+  # Community setup precedes the build phase that normally activates MSVC.
+  powershell -NoProfile -File "$repo_root/scripts/configure-ci-windows.ps1"
+  exit 0
+fi
 cargo install mbx --version 1.27.0 --locked --root "$repo_root/.ci/tools"
