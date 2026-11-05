@@ -103,7 +103,7 @@ export VCPKG_ROOT="$vcpkg_root"
 export VCPKG_DOWNLOADS="$task_root/vcpkg-downloads"
 mkdir -p "$VCPKG_DOWNLOADS" "$generated_manifest_dir"
 
-extension_config="$extension_dir/extension_config.cmake"
+extension_config="$extension_dir/extension_config_legacy.cmake"
 toolchain_file="$vcpkg_root/scripts/buildsystems/vcpkg.cmake"
 
 manifest_cmake_args=(

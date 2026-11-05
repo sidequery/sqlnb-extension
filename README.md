@@ -27,9 +27,10 @@ load sqlnb from sidequery;
 select sqlnb_start();
 ```
 
-Keep DuckDB running while you use the browser. SQLNB loads its Quack, `httpfs`,
-and `icu` dependencies automatically. The first launch needs an internet
-connection to download the UI; subsequent launches can use a verified cached copy.
+Keep DuckDB running while you use the browser. SQLNB loads the official Quack,
+`httpfs`, and `icu` dependencies from DuckDB core automatically. The first launch
+needs an internet connection to download the UI; subsequent launches can use a
+verified cached copy.
 
 Use `select sqlnb_status();` to see the local URL and `select sqlnb_stop();` to
 stop the server. Restart the server to pick up UI updates.
@@ -56,3 +57,8 @@ To connect an MCP client, start with `mcp := true` and follow the
 - [MCP reference](docs/mcp.md) — authentication, tools, and execution behavior.
 - [UI assets](docs/ui-assets.md) — custom frontends, updates, and the deployment contract.
 - [Release procedures](docs/releases.md) — maintainer builds, signing, and publication.
+
+## License
+
+The native extension is [MIT licensed](LICENSE). The separately hosted Sidequery
+UI is not included in this repository or covered by its license.

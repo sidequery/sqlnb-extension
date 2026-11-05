@@ -8,6 +8,29 @@ checkout or frontend build is required.
 
 Run the commands below from the repository root.
 
+## Community build
+
+The DuckDB and extension-ci-tools submodules pin DuckDB 2.0.0 and its community
+build tooling. Initialize them before using the standard extension targets:
+
+```sh
+git submodule update --init --recursive
+make setup-vcpkg
+VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" GEN=ninja make release
+make test
+```
+
+The SQL tests start the server with a small local UI fixture, exercise MCP owner
+isolation and shutdown, and verify invalid startup options and disabled external
+access. They install runtime dependencies from DuckDB's core repository; they
+do not need a Sidequery repository registration or the hosted UI.
+
+The [community workflow](../.github/workflows/community.yml) uses DuckDB's reusable
+distribution workflow for Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows
+MSVC. Wasm cannot provide the native server's sockets and filesystem; Windows
+MinGW is not supported. The CI setup hook installs Boxington into the disposable
+workspace when another compiler wrapper is not already configured.
+
 ## Rust tests
 
 ```sh

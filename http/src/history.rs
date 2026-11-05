@@ -521,6 +521,11 @@ impl Transaction<'_> {
             sync_history_path(&entry.map_err(err)?.path()).map_err(err)?;
         }
         sync_history_path(&packs).map_err(err)?;
+        let pack_name = builder.name().map(|s| format!("pack-{s}"));
+        drop(builder);
+        // libgit2 retains pack handles without delete sharing on Windows. Reopen
+        // its lazy object database before removing old packs; keep our lock held.
+        self.repo = Repository::open_bare(self.repo.path()).map_err(err)?;
         // All live objects are durably packed. Remove loose objects and superseded packs only.
         for entry in fs::read_dir(&objects).map_err(err)? {
             let entry = entry.map_err(err)?;
@@ -530,7 +535,6 @@ impl Transaction<'_> {
                 fs::remove_dir_all(entry.path()).map_err(err)?;
             }
         }
-        let pack_name = builder.name().map(|s| format!("pack-{s}"));
         for path in previous {
             if pack_name
                 .as_ref()
