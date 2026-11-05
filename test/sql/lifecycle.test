@@ -46,7 +46,7 @@ set autoinstall_extension_repository = 'http://extensions.duckdb.org';
 # This is the public fixture key from DuckDB's extension_repositories_lock test;
 # the unreachable repository intentionally cannot serve any extensions.
 statement ok
-set extension_repository_directory = '{TEST_DIR}/sqlnb-repositories';
+set extension_repository_directory = '{TEMP_DIR_ABSOLUTE}/sqlnb-repositories';
 
 statement ok
 set allow_extension_repositories = 'allowed';
@@ -55,7 +55,7 @@ statement ok
 create extension repository sidequery with prefix 'http://127.0.0.1:1' using public key 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt9+KeDkWJa7SiBb7AMdXAPV2qpRunztoC2c7DtRmN9+Lq2YQm4rMQmmAQcwyxTxcK8vwPKOiE4mLMwmQMvTty9tL+buREfvg5KJ+FY3Bv05cZYsf7VuYgUDcw41zSEE5W1thh5PiafcrMn7CPF0jN0oFfVvAHB/fAM0yaZGPKs3WYqnHAHa6v/cVMeiWZ/lQORCBqqL2hii1fEiuIqw6AOEoZVsN0/lqm7GfnD899zrzLOPRuP4YFg46drL1UyNdg+4TquJ2OV9kR4CAfdGRexqHFWLmoxkTfnUxJ4yL+gkV57K1H+smEdKrDhDX68pEFM/34E2eVKZoRU/0paxDZQIDAQAB';
 
 query T
-select json_extract(sqlnb_start(assets := 'test/fixtures/ui', notebook_root := '{TEST_DIR}/sqlnb-lifecycle', open_browser := false, mcp := true), '$.running');
+select json_extract(sqlnb_start(assets := '{WORKING_DIRECTORY}/test/fixtures/ui', notebook_root := '{TEMP_DIR_ABSOLUTE}/sqlnb-lifecycle', open_browser := false, mcp := true), '$.running');
 ----
 true
 
@@ -104,6 +104,6 @@ statement ok
 set enable_external_access = false;
 
 statement error
-select sqlnb_start(assets := 'test/fixtures/ui', open_browser := false);
+select sqlnb_start(assets := '{WORKING_DIRECTORY}/test/fixtures/ui', open_browser := false);
 ----
 SQLNB requires enable_external_access=true

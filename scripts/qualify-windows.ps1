@@ -16,7 +16,7 @@ foreach ($Checkout in @(@('https://github.com/duckdb/duckdb.git', $DuckDBRevisio
     if ((git -C $Checkout[2] rev-parse HEAD) -ne $Checkout[1]) { throw 'Dependency revision mismatch' }
 }
 & (Join-Path $Vcpkg 'bootstrap-vcpkg.bat') -disableMetrics
-& (Join-Path $Vcpkg 'vcpkg.exe') install openssl:x64-windows-static zlib:x64-windows-static
+& (Join-Path $Vcpkg 'vcpkg.exe') install --classic openssl:x64-windows-static zlib:x64-windows-static
 cmake -S $DuckDB -B $Build -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_TOOLCHAIN_FILE=$Vcpkg/scripts/buildsystems/vcpkg.cmake" `
     -DVCPKG_MANIFEST_MODE=OFF -DVCPKG_TARGET_TRIPLET=x64-windows-static `
