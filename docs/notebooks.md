@@ -16,6 +16,8 @@ A browser does not tell a page where a dropped file is stored, so the notebook U
 - An existing name is never replaced: the upload is saved as `name (2).csv`, `name (3).csv` and so on. The folder and file names are opened relative to the notebook root's descriptor without following symlinks, so a symlinked `.sqlnb-imports` is refused and a symlink inside it is neither written through nor deleted.
 - A declared `Content-Length` above `maxBytes` is refused with `413` before reading; the body is also counted while it streams. Bytes go to a temporary file that is renamed into place only after the whole body arrives and is synced; a refused, failed or aborted upload removes it.
 
+`PUT` also takes an optional `id`, a lowercase hyphenated UUID chosen by the client. An aborted request cannot cancel an upload whose whole body the server already received and saved, so a client that cancels also sends `DELETE /api/v1/import?id=<id>`: it deletes the file if that upload was saved, and otherwise makes the upload fail before it is saved. Publishing and cancelling are decided under one lock, so one of the two always wins cleanly. Ids are used once; the server remembers the latest 1024.
+
 `DELETE /api/v1/import?name=<saved name>` removes one uploaded file by the name the upload returned. Uploaded files otherwise stay until the user deletes them.
 
 ## DuckDB UI notebooks

@@ -59,8 +59,64 @@ pub(crate) fn is_imports_entry(path: &str) -> bool {
 }
 
 #[derive(Deserialize)]
-struct NameQuery {
+struct UploadQuery {
     name: String,
+    /// Client-chosen UUID by which the client can cancel this upload.
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoveQuery {
+    name: Option<String>,
+    id: Option<String>,
+}
+
+/// Uploads a client may still cancel, by notebook root and upload id. Cancelling
+/// by id covers the race an aborted request cannot: the server may have received
+/// the whole body, and saved it, before the client's abort arrives.
+#[derive(Default)]
+struct Uploads {
+    states: std::collections::HashMap<(PathBuf, String), UploadState>,
+    order: std::collections::VecDeque<(PathBuf, String)>,
+}
+
+enum UploadState {
+    Receiving,
+    Cancelled,
+    Saved(String),
+}
+
+const MAX_TRACKED_UPLOADS: usize = 1024;
+static UPLOADS: std::sync::LazyLock<Mutex<Uploads>> = std::sync::LazyLock::new(Default::default);
+
+fn uploads() -> std::sync::MutexGuard<'static, Uploads> {
+    UPLOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Uploads {
+    fn set(&mut self, key: &(PathBuf, String), state: UploadState) {
+        if self.states.insert(key.clone(), state).is_none() {
+            self.order.push_back(key.clone());
+        }
+        while self.order.len() > MAX_TRACKED_UPLOADS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.states.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn upload_id(value: &str) -> Result<String, ApiError> {
+    match uuid::Uuid::parse_str(value) {
+        Ok(id) if id.hyphenated().to_string() == value => Ok(value.to_owned()),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_upload_id",
+            "id must be a lowercase hyphenated UUID",
+        )),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -206,11 +262,12 @@ enum Chunk {
 }
 
 /// Writes chunks to a temporary file and gives it the first free numbered name
-/// once `Finish` arrives. If the sender goes away first, or anything fails, the
-/// temporary file is removed.
+/// once `Finish` arrives. If the sender goes away first, the upload was cancelled
+/// by id, or anything fails, the temporary file is removed.
 fn write_upload(
     store: &NotebookStore,
     name: &str,
+    tracked: Option<&(PathBuf, String)>,
     mut chunks: tokio::sync::mpsc::Receiver<Chunk>,
 ) -> Result<(String, u64), ApiError> {
     let folder = open_imports_folder(store, true)?;
@@ -231,11 +288,22 @@ fn write_upload(
             }
         }
         file.sync_all().map_err(file_io)?;
+        // Publishing and cancelling by id are decided under one lock: either the
+        // cancel comes first and nothing is published, or it finds the saved name.
+        let mut registry = tracked.map(|key| (key, uploads()));
+        if let Some((key, registry)) = &registry {
+            if matches!(registry.states.get(*key), Some(UploadState::Cancelled)) {
+                return Err(aborted());
+            }
+        }
         for number in 1..=MAX_NUMBERED_NAMES {
             let candidate = numbered(name, number);
             let destination = CString::new(candidate.as_str()).map_err(|_| invalid_name())?;
             match rename_no_replace(parent, &temporary, parent, &destination) {
                 Ok(()) => {
+                    if let Some((key, registry)) = registry.as_mut() {
+                        registry.set(key, UploadState::Saved(candidate.clone()));
+                    }
                     sync_directory(parent).map_err(file_io)?;
                     return Ok(candidate);
                 }
@@ -263,14 +331,24 @@ fn write_upload(
 pub(crate) async fn receive(
     store: Arc<NotebookStore>,
     name: String,
+    id: Option<String>,
     mut body: Body,
     limit: u64,
 ) -> Result<UploadResponse, ApiError> {
+    let tracked = id.map(|id| (store.root.clone(), id));
+    if let Some(key) = &tracked {
+        let mut registry = uploads();
+        // An id is used once; one cancelled before its upload began stays cancelled.
+        if registry.states.contains_key(key) {
+            return Err(aborted());
+        }
+        registry.set(key, UploadState::Receiving);
+    }
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
     let writer_store = store.clone();
-    let writer_name = name.clone();
-    let writer =
-        tokio::task::spawn_blocking(move || write_upload(&writer_store, &writer_name, receiver));
+    let writer = tokio::task::spawn_blocking(move || {
+        write_upload(&writer_store, &name, tracked.as_ref(), receiver)
+    });
     let mut received = 0u64;
     let streamed = async {
         while let Some(frame) = body.frame().await {
@@ -312,11 +390,12 @@ pub(crate) async fn receive(
 async fn upload(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<NameQuery>,
+    Query(query): Query<UploadQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&headers, &state)?;
     let name = safe_name(&query.name)?;
+    let id = query.id.as_deref().map(upload_id).transpose()?;
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -324,39 +403,67 @@ async fn upload(
     if declared.is_some_and(|length| length > MAX_IMPORT_BYTES) {
         return Err(too_large(MAX_IMPORT_BYTES));
     }
-    let response = receive(state.notebooks.clone(), name, body, MAX_IMPORT_BYTES).await?;
+    let response = receive(state.notebooks.clone(), name, id, body, MAX_IMPORT_BYTES).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// Deletes one uploaded file by the name the upload returned.
+fn delete_saved(store: &NotebookStore, name: &str) -> Result<(), ApiError> {
+    let folder = open_imports_folder(store, false)?;
+    let parent = folder.platform_handle();
+    let file = CString::new(name).map_err(|_| invalid_name())?;
+    let not_found = || ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such uploaded file");
+    let identity = metadata_at(parent, &file).map_err(|_| not_found())?;
+    if !identity.regular {
+        return Err(not_found());
+    }
+    remove_file_at(parent, &file).map_err(file_io)?;
+    sync_directory(parent).map_err(file_io)
+}
+
+/// Deletes one uploaded file by the name the upload returned (`?name=`), or
+/// cancels an upload by its id (`?id=`), deleting its file if it was already saved.
 async fn remove(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<NameQuery>,
+    Query(query): Query<RemoveQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&headers, &state)?;
-    let name = safe_name(&query.name)?;
-    if name != query.name {
-        return Err(invalid_name());
-    }
     let store = state.notebooks.clone();
-    let removed = name.clone();
-    tokio::task::spawn_blocking(move || {
-        let folder = open_imports_folder(&store, false)?;
-        let parent = folder.platform_handle();
-        let file = CString::new(name).map_err(|_| invalid_name())?;
-        let not_found =
-            || ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such uploaded file");
-        let identity = metadata_at(parent, &file).map_err(|_| not_found())?;
-        if !identity.regular {
-            return Err(not_found());
+    match (query.name, query.id) {
+        (Some(name), None) => {
+            if safe_name(&name)? != name {
+                return Err(invalid_name());
+            }
+            let removed = name.clone();
+            tokio::task::spawn_blocking(move || delete_saved(&store, &name))
+                .await
+                .map_err(|_| task_failed())??;
+            Ok(Json(serde_json::json!({ "name": removed })))
         }
-        remove_file_at(parent, &file).map_err(file_io)?;
-        sync_directory(parent).map_err(file_io)
-    })
-    .await
-    .map_err(|_| task_failed())??;
-    Ok(Json(serde_json::json!({ "name": removed })))
+        (None, Some(id)) => {
+            let key = (store.root.clone(), upload_id(&id)?);
+            tokio::task::spawn_blocking(move || {
+                let mut registry = uploads();
+                if let Some(UploadState::Saved(name)) = registry.states.get(&key) {
+                    match delete_saved(&store, &name.clone()) {
+                        Ok(()) => {}
+                        Err(error) if error.status == StatusCode::NOT_FOUND => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                registry.set(&key, UploadState::Cancelled);
+                Ok(())
+            })
+            .await
+            .map_err(|_| task_failed())??;
+            Ok(Json(serde_json::json!({ "id": id, "cancelled": true })))
+        }
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "pass either name or id",
+        )),
+    }
 }
 
 #[cfg(test)]

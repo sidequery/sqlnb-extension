@@ -312,6 +312,7 @@ async fn enforces_the_limit_while_streaming_and_removes_the_partial_file() {
     let error = receive(
         store.clone(),
         "big.csv".into(),
+        None,
         Body::from(vec![b'x'; 4096]),
         1024,
     )
@@ -320,9 +321,15 @@ async fn enforces_the_limit_while_streaming_and_removes_the_partial_file() {
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(fixture.saved().is_empty());
     // Exactly at the limit is accepted.
-    let saved = receive(store, "fits.csv".into(), Body::from(vec![b'x'; 1024]), 1024)
-        .await
-        .unwrap();
+    let saved = receive(
+        store,
+        "fits.csv".into(),
+        None,
+        Body::from(vec![b'x'; 1024]),
+        1024,
+    )
+    .await
+    .unwrap();
     assert_eq!(saved.bytes, 1024);
     assert_eq!(fixture.saved(), ["fits.csv"]);
 }
@@ -415,4 +422,54 @@ async fn deletes_only_an_uploaded_file_by_its_saved_name() {
     assert_eq!(fixture.saved(), ["keep.csv"]);
     assert!(fixture.root.join("outside.csv").exists());
     assert!(fixture.imports().join(".gitignore").exists());
+}
+
+#[tokio::test]
+async fn cancelling_by_upload_id_discards_a_saved_or_later_upload() {
+    let fixture = Fixture::new();
+    let first = "6f1c1e8e-3c55-4f0a-9d8e-0a6b9a6c1f01";
+    let second = "6f1c1e8e-3c55-4f0a-9d8e-0a6b9a6c1f02";
+    // The whole body arrived and was saved before the client's cancel.
+    let uri = format!("/api/v1/import?name=a.csv&id={first}");
+    let (status, _) = fixture.send(fixture.request("PUT", &uri, b"a")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    fixture.upload("keep.csv", b"keep").await;
+    let uri = format!("/api/v1/import?id={first}");
+    let (status, body) = fixture.send(fixture.request("DELETE", &uri, b"")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["cancelled"], true);
+    assert_eq!(fixture.saved(), ["keep.csv"]);
+    // Cancelling again, or an id never seen, succeeds without touching files.
+    assert_eq!(
+        fixture.send(fixture.request("DELETE", &uri, b"")).await.0,
+        StatusCode::OK
+    );
+    let uri = format!("/api/v1/import?id={second}");
+    assert_eq!(
+        fixture.send(fixture.request("DELETE", &uri, b"")).await.0,
+        StatusCode::OK
+    );
+    // An upload whose id was cancelled before it began is refused.
+    let uri = format!("/api/v1/import?name=b.csv&id={second}");
+    let (status, body) = fixture.send(fixture.request("PUT", &uri, b"b")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "upload_aborted");
+    assert_eq!(fixture.saved(), ["keep.csv"]);
+
+    for uri in [
+        "/api/v1/import?name=c.csv&id=not-a-uuid",
+        "/api/v1/import?name=c.csv&id=6F1C1E8E-3C55-4F0A-9D8E-0A6B9A6C1F03",
+    ] {
+        let (status, body) = fixture.send(fixture.request("PUT", uri, b"c")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(body["error"]["code"], "invalid_upload_id");
+    }
+    for uri in [
+        "/api/v1/import",
+        "/api/v1/import?name=keep.csv&id=6f1c1e8e-3c55-4f0a-9d8e-0a6b9a6c1f04",
+    ] {
+        let (status, _) = fixture.send(fixture.request("DELETE", uri, b"")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert_eq!(fixture.saved(), ["keep.csv"]);
 }
