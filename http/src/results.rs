@@ -368,8 +368,7 @@ impl ResultStore {
         reserved
     }
 
-    fn complete(&self, id: &str, stored: StoredResult, stored_bytes: u64) {
-        let now_ms = (self.clock)();
+    fn complete(&self, id: &str, stored: StoredResult, stored_bytes: u64, now_ms: i64) {
         let mut state = self.lock();
         match state.entries.get_mut(id) {
             Some(entry) => {
@@ -757,14 +756,17 @@ fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Resu
     Ok(())
 }
 
+/// Removed when dropped unless it was published.
 struct SpillFile {
-    file: File,
+    /// Closed once the footer is written.
+    file: Option<File>,
     directory: PathBuf,
     temporary: PathBuf,
     path: PathBuf,
     /// The first free byte. A batch claims its place here and is written
     /// there without a lock, so threads write at the same time.
     end: AtomicU64,
+    published: bool,
 }
 
 impl SpillFile {
@@ -779,42 +781,45 @@ impl SpillFile {
             return Err(error.to_string());
         }
         Ok(Self {
-            file,
+            file: Some(file),
             directory: directory.to_path_buf(),
             temporary,
             path: directory.join(format!("{id}.arrow")),
             end: AtomicU64::new(header.len() as u64),
+            published: false,
         })
     }
 
     fn write(&self, batch: &RecordBatch) -> Result<Block, LimitReason> {
+        let file = self.file.as_ref().expect("a result file is open until it is finished");
         let (bytes, metadata, body) = encode_batch(batch).map_err(|_| LimitReason::Io)?;
         let offset = self.end.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        write_all_at(&self.file, &bytes, offset).map_err(|_| LimitReason::Io)?;
+        write_all_at(file, &bytes, offset).map_err(|_| LimitReason::Io)?;
         Ok(Block::new(offset as i64, metadata as i32, body as i64))
     }
 
     /// Writes the footer and publishes the file under its final name.
-    fn finish(self, schema: &Schema, blocks: &[Block]) -> Result<(PathBuf, u64), String> {
-        let temporary = self.temporary.clone();
-        let result = (|| {
-            let footer = file_footer(schema, blocks);
-            let end = self.end.load(Ordering::Relaxed);
-            write_all_at(&self.file, &footer, end).map_err(|error| error.to_string())?;
-            // Windows cannot rename a file that is still open.
-            drop(self.file);
-            fs::rename(&self.temporary, &self.path).map_err(|error| error.to_string())?;
-            Ok((self.path, end + footer.len() as u64))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+    fn finish(mut self, schema: &Schema, blocks: &[Block]) -> Result<(PathBuf, u64), String> {
+        let footer = file_footer(schema, blocks);
+        let end = self.end.load(Ordering::Relaxed);
+        let file = self.file.take().expect("a result file is open until it is finished");
+        let written = write_all_at(&file, &footer, end);
+        // Windows cannot rename a file that is still open.
+        drop(file);
+        written.map_err(|error| error.to_string())?;
+        fs::rename(&self.temporary, &self.path).map_err(|error| error.to_string())?;
+        self.published = true;
+        Ok((self.path.clone(), end + footer.len() as u64))
     }
+}
 
-    fn discard(self) {
-        drop(self.file);
-        let _ = fs::remove_file(self.temporary);
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        // Windows cannot remove a file that is still open.
+        drop(self.file.take());
+        if !self.published {
+            let _ = fs::remove_file(&self.temporary);
+        }
     }
 }
 
@@ -956,13 +961,7 @@ impl ResultWriter {
             let BatchData::Memory(batch) = &stored.data else {
                 unreachable!("a result without a file keeps its batches in memory")
             };
-            match file.write(batch) {
-                Ok(block) => blocks.push(block),
-                Err(reason) => {
-                    file.discard();
-                    return Err(reason);
-                }
-            }
+            blocks.push(file.write(batch)?);
         }
         for (stored, block) in state.batches.iter_mut().zip(blocks) {
             stored.data = BatchData::File(block);
@@ -983,7 +982,6 @@ impl ResultWriter {
     /// Makes the result readable. `rows` is the number of rows the statement
     /// produced, or only those it read when it stopped early (`rows_exact` false).
     pub(crate) fn finish(mut self, rows: u64, rows_exact: bool) {
-        self.finished = true;
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         let mut state = std::mem::take(&mut *self.lock());
         state.batches.sort_by_key(|stored| stored.key);
@@ -1000,6 +998,9 @@ impl ResultWriter {
             batch_ends.push(stored_rows);
         }
         let mut limit_reason = state.limit_reason;
+        // Read before the file is published, after which nothing may unwind:
+        // an unwinding writer forgets its result, which would leave the file.
+        let now_ms = (self.store.clock)();
         let data = match state.file.take() {
             None => StoredData::Memory(
                 state
@@ -1048,7 +1049,9 @@ impl ResultWriter {
             batch_ends,
             data,
         };
-        self.store.complete(&self.id, stored, stored_bytes);
+        self.store.complete(&self.id, stored, stored_bytes, now_ms);
+        // Until here, dropping the writer forgets the result.
+        self.finished = true;
     }
 }
 
@@ -1057,10 +1060,8 @@ impl Drop for ResultWriter {
         if self.finished {
             return;
         }
-        let file = self.lock().file.take();
-        if let Some(file) = file.and_then(Arc::into_inner) {
-            file.discard();
-        }
+        // The file is removed before the id is free again.
+        drop(self.lock().file.take());
         self.store.forget(&self.id);
     }
 }

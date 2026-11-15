@@ -481,6 +481,23 @@ fn a_batch_that_panics_while_being_stored_is_missing() {
 }
 
 #[test]
+fn a_finish_that_panics_forgets_the_result_and_its_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    let writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
+    assert!(writer.append(batch(0, 4), (0, 0)));
+    assert_eq!(session_files(directory.path()), [format!("{}.arrow.tmp", id(1)), SESSION_LOCK.to_string()]);
+    // Finishing reads the clock once, before it publishes the file.
+    environment.panic_next.store(true, Ordering::Relaxed);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.finish(4, true))).is_err());
+    assert!(listed(&store).is_empty());
+    assert_eq!(session_files(directory.path()), [SESSION_LOCK]);
+    // The id is free again.
+    store_result(&store, &id(1), &[2], limits(0));
+    assert_eq!(listed_ids(&store), [id(1)]);
+}
+
+#[test]
 fn threads_store_batches_at_the_same_time() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(directory.path());
