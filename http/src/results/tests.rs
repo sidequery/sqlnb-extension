@@ -44,10 +44,10 @@ fn id(number: u8) -> String {
 
 /// Stores batches of the given sizes, numbering rows from 0.
 fn store_result(store: &Arc<ResultStore>, id: &str, sizes: &[i64], limits: ResultLimits) {
-    let mut writer = store.begin(id, "meta", schema(), limits).unwrap();
+    let writer = store.begin(id, "meta", schema(), limits).unwrap();
     let mut start = 0;
-    for &size in sizes {
-        writer.append(batch(start, size));
+    for (position, &size) in sizes.iter().enumerate() {
+        writer.append(batch(start, size), (0, position as u64));
         start += size;
     }
     writer.finish(start as u64, true);
@@ -186,8 +186,8 @@ fn ids_are_validated_and_unique() {
 fn unfinished_results_are_neither_listed_nor_readable_and_abort_leaves_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(directory.path());
-    let mut writer = store.begin(&id(1), "", schema(), limits(2)).unwrap();
-    assert!(writer.append(batch(0, 5)));
+    let writer = store.begin(&id(1), "", schema(), limits(2)).unwrap();
+    assert!(writer.append(batch(0, 5), (0, 0)));
     assert_eq!(session_files(directory.path()), [format!("{}.arrow.tmp", id(1)), SESSION_LOCK.to_string()]);
     assert!(listed(&store).is_empty());
     assert!(store.scan(&id(1), 0, UNLIMITED, None, &[0]).is_err());
@@ -203,7 +203,7 @@ fn the_result_limit_keeps_a_prefix_and_counts_every_row() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(directory.path());
     let batch_size = batch_bytes(&batch(0, 100));
-    let mut writer = store
+    let writer = store
         .begin(
             &id(1),
             "",
@@ -215,15 +215,12 @@ fn the_result_limit_keeps_a_prefix_and_counts_every_row() {
             },
         )
         .unwrap();
-    assert!(writer.append(batch(0, 100)));
-    assert!(!writer.append(batch(100, 100)));
-    assert!(!writer.append(batch(200, 100)));
+    assert!(writer.append(batch(0, 100), (0, 0)));
+    assert!(!writer.append(batch(100, 100), (0, 1)));
+    assert!(!writer.append(batch(200, 100), (0, 2)));
     writer.finish(300, true);
-    let [(_, rows, stored_rows, _, reason, _)] = listed(&store).try_into().unwrap();
-    assert_eq!((rows, reason.as_deref()), (300, Some("result-bytes")));
-    assert!((140..=160).contains(&stored_rows), "{stored_rows}");
-    let values = scan_values(&store, &id(1), 0, UNLIMITED, None, &[0]);
-    assert_eq!(values[0], (0..stored_rows).collect::<Vec<_>>());
+    assert_eq!(listed(&store), [(id(1), 300, 100, true, Some("result-bytes".into()), true)]);
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..100).collect::<Vec<_>>());
 }
 
 #[test]
@@ -244,8 +241,8 @@ fn the_cache_limit_evicts_the_oldest_other_results() {
     assert!(store.scan_schema(&id(1), None).unwrap_err().starts_with("SQLNB_RESULT_MISSING:"));
 
     // An unfinished result cannot be evicted; the newer one stops storing instead.
-    let mut writer = store.begin(&id(4), "", schema(), cache).unwrap();
-    assert!(writer.append(batch(0, 100)));
+    let writer = store.begin(&id(4), "", schema(), cache).unwrap();
+    assert!(writer.append(batch(0, 100), (0, 0)));
     store_result(&store, &id(5), &[100, 100], cache);
     writer.finish(100, true);
     assert_eq!(
@@ -261,10 +258,10 @@ fn the_cache_limit_evicts_the_oldest_other_results() {
 fn stopping_early_reports_a_lower_bound() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(directory.path());
-    let mut writer = store.begin(&id(1), "", schema(), limits(10)).unwrap();
-    writer.append(batch(0, 5));
-    writer.stop(LimitReason::Io);
-    assert!(!writer.append(batch(5, 5)));
+    let writer = store.begin(&id(1), "", schema(), limits(10)).unwrap();
+    writer.append(batch(0, 5), (0, 0));
+    writer.missing((0, 1), LimitReason::Io);
+    assert!(!writer.append(batch(5, 5), (0, 1)));
     writer.finish(10, false);
     assert_eq!(listed(&store), [(id(1), 10, 5, true, Some("io".into()), false)]);
 }
@@ -273,9 +270,9 @@ fn stopping_early_reports_a_lower_bound() {
 fn an_unavailable_cache_directory_keeps_the_memory_prefix() {
     let store = Arc::new(ResultStore::new(Err("no cache root".into())));
     store.retain();
-    let mut writer = store.begin(&id(1), "", schema(), limits(4)).unwrap();
-    assert!(writer.append(batch(0, 4)));
-    assert!(!writer.append(batch(4, 4)));
+    let writer = store.begin(&id(1), "", schema(), limits(4)).unwrap();
+    assert!(writer.append(batch(0, 4), (0, 0)));
+    assert!(!writer.append(batch(4, 4), (0, 1)));
     writer.finish(8, true);
     assert_eq!(listed(&store), [(id(1), 8, 4, true, Some("io".into()), true)]);
     assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..4).collect::<Vec<_>>());
@@ -337,13 +334,76 @@ fn stale_sessions_are_removed_when_a_session_starts() {
 fn batches_arrive_through_the_c_data_interface() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(directory.path());
-    let mut writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
+    let writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
     for start in [0, 4] {
         let exported = StructArray::from(batch(start, 4)).into_data();
         let (array, _) = arrow_array::ffi::to_ffi(&exported).unwrap();
-        assert!(writer.append_ffi(array));
+        assert!(writer.append_ffi(array, (0, start as u64)));
     }
     writer.finish(8, true);
     let values = scan_values(&store, &id(1), 0, UNLIMITED, Some("n"), &[1, 2]);
     assert_eq!(values, [(0..8).collect::<Vec<_>>(), (0..8).collect()]);
+}
+
+#[test]
+fn batches_stored_out_of_order_are_read_in_key_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_store(directory.path());
+    // In memory, then in a file that the third batch starts.
+    for (result, head_rows) in [(id(1), 100), (id(2), 8)] {
+        let writer = store.begin(&result, "", schema(), limits(head_rows)).unwrap();
+        for (key, start, rows) in [((2, 0), 9, 3), ((1, 1), 6, 3), ((0, 0), 0, 4), ((1, 0), 4, 2)] {
+            assert!(writer.append(batch(start, rows), key));
+        }
+        writer.finish(12, true);
+        let values = scan_values(&store, &result, 0, UNLIMITED, Some("n"), &[0, 2]);
+        assert_eq!(values, [(0..12).collect::<Vec<_>>(), (0..12).collect()]);
+        assert_eq!(scan_values(&store, &result, 5, 5, None, &[1])[0], (5..10).collect::<Vec<_>>());
+    }
+    assert_eq!(listed(&store).iter().map(|result| result.3).collect::<Vec<_>>(), [false, true]);
+    // Another reader of the file sees the same order: the footer carries it.
+    let path = fs::read_dir(directory.path()).unwrap().flatten().next().unwrap().path().join(format!("{}.arrow", id(2)));
+    let reader = FileReader::try_new(File::open(path).unwrap(), None).unwrap();
+    let values: Vec<i64> = reader
+        .flat_map(|batch| batch.unwrap().column(0).as_primitive::<Int64Type>().values().to_vec())
+        .collect();
+    assert_eq!(values, (0..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_missing_batch_keeps_only_the_batches_before_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_store(directory.path());
+    let writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
+    assert!(writer.append(batch(0, 4), (0, 0)));
+    assert!(writer.append(batch(8, 4), (2, 0)));
+    writer.missing((1, 0), LimitReason::Io);
+    assert!(!writer.append(batch(12, 4), (3, 0)));
+    writer.finish(16, true);
+    assert_eq!(listed(&store), [(id(1), 16, 4, false, Some("io".into()), true)]);
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..4).collect::<Vec<_>>());
+}
+
+#[test]
+fn threads_store_batches_at_the_same_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_store(directory.path());
+    let writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
+    const THREADS: i64 = 8;
+    const BATCHES: i64 = 50;
+    const ROWS: i64 = 100;
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let writer = &writer;
+            scope.spawn(move || {
+                // Each thread owns every eighth batch, as a thread owns its part of a scan.
+                for batch_number in (thread..THREADS * BATCHES).step_by(THREADS as usize) {
+                    assert!(writer.append(batch(batch_number * ROWS, ROWS), (batch_number as u64, 0)));
+                }
+            });
+        }
+    });
+    let total = THREADS * BATCHES * ROWS;
+    writer.finish(total as u64, true);
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..total).collect::<Vec<_>>());
 }

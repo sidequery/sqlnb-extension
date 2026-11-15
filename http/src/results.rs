@@ -11,14 +11,18 @@ use arrow_array::{
     RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
 use arrow_data::ArrayData;
+use arrow_ipc::convert::IpcSchemaEncoder;
 use arrow_ipc::reader::{FileReader, FileReaderBuilder};
-use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
+use arrow_ipc::writer::{write_message, DictionaryTracker, FileWriter, IpcDataGenerator, IpcWriteOptions};
+use arrow_ipc::{Block, FooterBuilder, MetadataVersion};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use flatbuffers::FlatBufferBuilder;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +34,8 @@ const SESSION_LOCK: &str = "session.lock";
 /// A live process locks its session directory moments after creating it, so an
 /// unlocked directory older than this belongs to a process that is gone.
 const SESSION_CLAIM_GRACE: Duration = Duration::from_secs(60);
-const FILE_BUFFER_BYTES: usize = 1024 * 1024;
+/// Messages and their bodies start on this boundary in a result file.
+const FILE_ALIGNMENT: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LimitReason {
@@ -189,66 +194,50 @@ impl ResultStore {
             schema,
             limits,
             started: Instant::now(),
-            stored_rows: 0,
-            stored_bytes: 0,
-            batch_ends: Vec::new(),
-            memory: Vec::new(),
-            file: None,
-            limit_reason: None,
+            storing: AtomicBool::new(true),
+            state: Mutex::new(WriterState::default()),
             finished: false,
         })
     }
 
-    /// Grants up to `requested` more stored bytes to the result `id`, evicting the
+    /// Counts `requested` more stored bytes for the result `id`, evicting the
     /// oldest other readable results when the whole cache would exceed its limit.
-    fn reserve(
-        &self,
-        id: &str,
-        stored_bytes: u64,
-        requested: u64,
-        limits: &ResultLimits,
-    ) -> (u64, Option<LimitReason>) {
-        let result_room = limits.max_result_bytes.saturating_sub(stored_bytes);
-        let needed = requested.min(result_room);
+    fn reserve(&self, id: &str, requested: u64, limits: &ResultLimits) -> Result<(), LimitReason> {
         let mut evicted = Vec::new();
-        let granted = {
+        let reserved = {
             let mut state = self.lock();
-            if !state.entries.contains_key(id) {
-                // The cache closed while this statement ran.
-                return (0, Some(LimitReason::Io));
+            // Without its entry, the cache closed while this statement ran.
+            let stored_bytes = state.entries.get(id).ok_or(LimitReason::Io)?.stored_bytes;
+            if stored_bytes.saturating_add(requested) > limits.max_result_bytes {
+                Err(LimitReason::ResultBytes)
+            } else {
+                let mut used: u64 = state.entries.values().map(|entry| entry.stored_bytes).sum();
+                while used.saturating_add(requested) > limits.max_cache_bytes {
+                    let oldest = state
+                        .entries
+                        .iter()
+                        .filter(|(other, entry)| other.as_str() != id && entry.stored.is_some())
+                        .min_by_key(|(_, entry)| entry.sequence)
+                        .map(|(other, _)| other.clone());
+                    let Some(oldest) = oldest else { break };
+                    let entry = state.entries.remove(&oldest).expect("oldest entry exists");
+                    used -= entry.stored_bytes;
+                    evicted.push(entry);
+                }
+                if used.saturating_add(requested) > limits.max_cache_bytes {
+                    Err(LimitReason::CacheBytes)
+                } else {
+                    if let Some(entry) = state.entries.get_mut(id) {
+                        entry.stored_bytes += requested;
+                    }
+                    Ok(())
+                }
             }
-            let mut used: u64 = state.entries.values().map(|entry| entry.stored_bytes).sum();
-            while used.saturating_add(needed) > limits.max_cache_bytes {
-                let oldest = state
-                    .entries
-                    .iter()
-                    .filter(|(other, entry)| other.as_str() != id && entry.stored.is_some())
-                    .min_by_key(|(_, entry)| entry.sequence)
-                    .map(|(other, _)| other.clone());
-                let Some(oldest) = oldest else { break };
-                let entry = state.entries.remove(&oldest).expect("oldest entry exists");
-                used -= entry.stored_bytes;
-                evicted.push(entry);
-            }
-            needed.min(limits.max_cache_bytes.saturating_sub(used))
         };
         for entry in evicted {
             entry.remove_file();
         }
-        let reason = if granted == requested {
-            None
-        } else if granted == result_room {
-            Some(LimitReason::ResultBytes)
-        } else {
-            Some(LimitReason::CacheBytes)
-        };
-        (granted, reason)
-    }
-
-    fn record_stored_bytes(&self, id: &str, stored_bytes: u64) {
-        if let Some(entry) = self.lock().entries.get_mut(id) {
-            entry.stored_bytes = stored_bytes;
-        }
+        reserved
     }
 
     fn complete(&self, id: &str, stored: StoredResult, stored_bytes: u64) {
@@ -489,7 +478,8 @@ fn with_row_number(schema: &Schema, row_number: Option<&str>) -> Result<Schema, 
 /// Uncompressed: LZ4 frames made files 2.6 times smaller on measured data but
 /// writing 35% and full scans 40% slower (docs/results.md).
 fn write_options() -> IpcWriteOptions {
-    IpcWriteOptions::default()
+    IpcWriteOptions::try_new(FILE_ALIGNMENT as usize, false, MetadataVersion::V5)
+        .expect("the result file options are valid")
 }
 
 fn unix_ms() -> i64 {
@@ -544,64 +534,137 @@ fn batch_bytes(batch: &RecordBatch) -> u64 {
     batch.columns().iter().map(|column| data_bytes(&column.to_data())).sum()
 }
 
-struct CountingWriter<W> {
-    inner: W,
-    bytes: u64,
+/// Where a batch belongs in its result. Batches are stored as they arrive,
+/// from any thread, and read back in the order of their keys.
+pub(crate) type BatchKey = (u64, u64);
+
+const FILE_MAGIC: &[u8; 6] = b"ARROW1";
+
+/// The start of an Arrow IPC file: the magic, padded, then the schema message.
+fn file_header(schema: &Schema) -> Result<Vec<u8>, ArrowError> {
+    let options = write_options();
+    let mut bytes = FILE_MAGIC.to_vec();
+    bytes.resize(FILE_ALIGNMENT as usize, 0);
+    let schema = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema,
+        &mut DictionaryTracker::new(true),
+        &options,
+    );
+    write_message(&mut bytes, schema, &options)?;
+    Ok(bytes)
 }
 
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        self.bytes += written as u64;
-        Ok(written)
+/// One record batch message, with the lengths its footer block records.
+fn encode_batch(batch: &RecordBatch) -> Result<(Vec<u8>, usize, usize), ArrowError> {
+    let options = write_options();
+    let (dictionaries, encoded) = IpcDataGenerator::default().encode(
+        batch,
+        &mut DictionaryTracker::new(true),
+        &options,
+        &mut Default::default(),
+    )?;
+    if !dictionaries.is_empty() {
+        // A dictionary would have to precede every batch that uses it.
+        return Err(ArrowError::IpcError("dictionary-encoded columns are not stored".into()));
     }
+    let mut bytes = Vec::with_capacity(encoded.ipc_message.len() + encoded.arrow_data.len() + 64);
+    let (metadata, body) = write_message(&mut bytes, encoded, &options)?;
+    Ok((bytes, metadata, body))
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+/// The end of an Arrow IPC file. The footer lists the batches in the order
+/// they are read, which is how batches written out of order become one result.
+fn file_footer(schema: &Schema, blocks: &[Block]) -> Vec<u8> {
+    // The end-of-stream marker Arrow's own writer puts before the footer.
+    let mut bytes = vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+    let mut builder = FlatBufferBuilder::new();
+    let dictionaries = builder.create_vector::<Block>(&[]);
+    let record_batches = builder.create_vector(blocks);
+    let mut tracker = DictionaryTracker::new(true);
+    let schema = IpcSchemaEncoder::new()
+        .with_dictionary_tracker(&mut tracker)
+        .schema_to_fb_offset(&mut builder, schema);
+    let root = {
+        let mut footer = FooterBuilder::new(&mut builder);
+        footer.add_version(MetadataVersion::V5);
+        footer.add_schema(schema);
+        footer.add_dictionaries(dictionaries);
+        footer.add_recordBatches(record_batches);
+        footer.finish()
+    };
+    builder.finish(root, None);
+    let footer = builder.finished_data();
+    bytes.extend_from_slice(footer);
+    bytes.extend_from_slice(&(footer.len() as i32).to_le_bytes());
+    bytes.extend_from_slice(FILE_MAGIC);
+    bytes
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        let written = file.seek_write(bytes, offset)?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[written..];
+        offset += written as u64;
     }
+    Ok(())
 }
 
 struct SpillFile {
-    writer: FileWriter<CountingWriter<BufWriter<File>>>,
+    file: File,
     temporary: PathBuf,
     path: PathBuf,
+    /// The first free byte. A batch claims its place here and is written
+    /// there without a lock, so threads write at the same time.
+    end: AtomicU64,
 }
 
 impl SpillFile {
     fn create(directory: &Path, id: &str, schema: &Schema) -> Result<Self, String> {
+        let header = file_header(schema).map_err(|error| error.to_string())?;
         let temporary = directory.join(format!("{id}.arrow.tmp"));
         let file = private_new_file(&temporary)
             .map_err(|error| format!("failed to create {}: {error}", temporary.display()))?;
-        let output = CountingWriter {
-            inner: BufWriter::with_capacity(FILE_BUFFER_BYTES, file),
-            bytes: 0,
-        };
-        match FileWriter::try_new_with_options(output, schema, write_options()) {
-            Ok(writer) => Ok(Self {
-                writer,
-                temporary,
-                path: directory.join(format!("{id}.arrow")),
-            }),
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                Err(error.to_string())
-            }
+        if let Err(error) = write_all_at(&file, &header, 0) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
         }
+        Ok(Self {
+            file,
+            temporary,
+            path: directory.join(format!("{id}.arrow")),
+            end: AtomicU64::new(header.len() as u64),
+        })
     }
 
-    fn bytes(&self) -> u64 {
-        self.writer.get_ref().bytes
+    fn write(&self, batch: &RecordBatch) -> Result<Block, LimitReason> {
+        let (bytes, metadata, body) = encode_batch(batch).map_err(|_| LimitReason::Io)?;
+        let offset = self.end.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        write_all_at(&self.file, &bytes, offset).map_err(|_| LimitReason::Io)?;
+        Ok(Block::new(offset as i64, metadata as i32, body as i64))
     }
 
     /// Writes the footer and publishes the file under its final name.
-    fn finish(self) -> Result<(PathBuf, u64), String> {
+    fn finish(self, schema: &Schema, blocks: &[Block]) -> Result<(PathBuf, u64), String> {
         let temporary = self.temporary.clone();
         let result = (|| {
-            let output = self.writer.into_inner().map_err(|error| error.to_string())?;
-            let bytes = output.bytes;
-            drop(output.inner.into_inner().map_err(|error| error.to_string())?);
+            let footer = file_footer(schema, blocks);
+            let end = self.end.load(Ordering::Relaxed);
+            write_all_at(&self.file, &footer, end).map_err(|error| error.to_string())?;
+            // Windows cannot rename a file that is still open.
+            drop(self.file);
             fs::rename(&self.temporary, &self.path).map_err(|error| error.to_string())?;
-            Ok((self.path, bytes))
+            Ok((self.path, end + footer.len() as u64))
         })();
         if result.is_err() {
             let _ = fs::remove_file(temporary);
@@ -610,13 +673,38 @@ impl SpillFile {
     }
 
     fn discard(self) {
-        let temporary = self.temporary.clone();
-        drop(self);
-        let _ = fs::remove_file(temporary);
+        drop(self.file);
+        let _ = fs::remove_file(self.temporary);
     }
 }
 
-/// Stores one statement's rows. Dropping an unfinished writer discards the result.
+struct StoredBatch {
+    key: BatchKey,
+    rows: u64,
+    bytes: u64,
+    data: BatchData,
+}
+
+enum BatchData {
+    Memory(RecordBatch),
+    File(Block),
+}
+
+#[derive(Default)]
+struct WriterState {
+    /// In the order they arrived.
+    batches: Vec<StoredBatch>,
+    file: Option<Arc<SpillFile>>,
+    stored_rows: u64,
+    stored_bytes: u64,
+    limit_reason: Option<LimitReason>,
+    /// The first batch of the result that was not stored. The result keeps the
+    /// batches before it.
+    first_missing: Option<BatchKey>,
+}
+
+/// Stores one statement's rows; any thread may append. Dropping an unfinished
+/// writer discards the result.
 pub(crate) struct ResultWriter {
     store: Arc<ResultStore>,
     id: String,
@@ -624,110 +712,116 @@ pub(crate) struct ResultWriter {
     batch_type: DataType,
     limits: ResultLimits,
     started: Instant,
-    stored_rows: u64,
-    stored_bytes: u64,
-    batch_ends: Vec<u64>,
-    memory: Vec<RecordBatch>,
-    file: Option<SpillFile>,
-    limit_reason: Option<LimitReason>,
+    /// Cleared once a limit or a failure ends storing.
+    storing: AtomicBool,
+    state: Mutex<WriterState>,
     finished: bool,
 }
 
 impl ResultWriter {
+    fn lock(&self) -> MutexGuard<'_, WriterState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Imports and stores a batch exported through the C Data Interface.
-    fn append_ffi(&mut self, array: FFI_ArrowArray) -> bool {
-        if self.limit_reason.is_some() {
+    fn append_ffi(&self, array: FFI_ArrowArray, key: BatchKey) -> bool {
+        if !self.storing.load(Ordering::Relaxed) {
+            self.missing(key, LimitReason::Io);
             return false;
         }
         let batch = unsafe { from_ffi_and_data_type(array, self.batch_type.clone()) }.and_then(|data| {
             RecordBatch::try_new(self.schema.clone(), StructArray::from(data).into_parts().1)
         });
         match batch {
-            Ok(batch) => self.append(batch),
+            Ok(batch) => self.append(batch, key),
             Err(_) => {
-                self.stop(LimitReason::Io);
+                self.missing(key, LimitReason::Io);
                 false
             }
         }
     }
 
-    /// Stores a batch, or the prefix of it that the limits allow. Returns whether
-    /// later batches can still be stored.
-    pub(crate) fn append(&mut self, batch: RecordBatch) -> bool {
-        if self.limit_reason.is_some() {
-            return false;
-        }
+    /// Stores a batch whole, or not at all once a limit is reached. Returns
+    /// whether later batches can still be stored.
+    pub(crate) fn append(&self, batch: RecordBatch, key: BatchKey) -> bool {
         let rows = batch.num_rows() as u64;
         if rows == 0 {
-            return true;
+            return self.storing.load(Ordering::Relaxed);
         }
-        let bytes = batch_bytes(&batch);
-        let (granted, reason) = self.store.reserve(&self.id, self.stored_bytes, bytes, &self.limits);
-        let (batch, rows, bytes) = if granted < bytes {
-            // Byte sizes are proportional enough to keep the prefix that fits.
-            let fitting = (u128::from(rows) * u128::from(granted) / u128::from(bytes.max(1))) as u64;
-            (batch.slice(0, fitting as usize), fitting, granted)
+        let stored = if self.storing.load(Ordering::Relaxed) {
+            let bytes = batch_bytes(&batch);
+            self.store
+                .reserve(&self.id, bytes, &self.limits)
+                .and_then(|()| self.store_batch(batch, key, rows, bytes))
         } else {
-            (batch, rows, bytes)
+            Err(LimitReason::Io)
         };
-        if rows > 0 {
-            if let Err(error) = self.store_batch(batch, rows, bytes) {
-                self.stop(error);
-                return false;
-            }
-        }
-        match reason {
-            Some(reason) => {
-                self.stop(reason);
+        match stored {
+            Ok(()) => true,
+            Err(reason) => {
+                self.missing(key, reason);
                 false
             }
-            None => true,
         }
     }
 
-    fn store_batch(&mut self, batch: RecordBatch, rows: u64, bytes: u64) -> Result<(), LimitReason> {
-        if self.file.is_none()
-            && (self.stored_rows + rows > self.limits.head_rows
-                || self.stored_bytes + bytes > MEMORY_RESULT_BYTES)
-        {
-            self.spill()?;
-        }
-        match &mut self.file {
-            Some(file) => {
-                file.writer.write(&batch).map_err(|_| LimitReason::Io)?;
-                self.stored_bytes = file.bytes();
+    fn store_batch(&self, batch: RecordBatch, key: BatchKey, rows: u64, bytes: u64) -> Result<(), LimitReason> {
+        let file = {
+            let mut state = self.lock();
+            if state.file.is_none() {
+                if state.stored_rows + rows <= self.limits.head_rows
+                    && state.stored_bytes + bytes <= MEMORY_RESULT_BYTES
+                {
+                    state.stored_rows += rows;
+                    state.stored_bytes += bytes;
+                    state.batches.push(StoredBatch { key, rows, bytes, data: BatchData::Memory(batch) });
+                    return Ok(());
+                }
+                self.spill(&mut state)?;
             }
-            None => {
-                self.memory.push(batch);
-                self.stored_bytes += bytes;
-            }
-        }
-        self.stored_rows += rows;
-        self.batch_ends.push(self.stored_rows);
-        self.store.record_stored_bytes(&self.id, self.stored_bytes);
+            state.file.clone().expect("a spilled result has a file")
+        };
+        // Encoded and written outside the lock: other threads do the same.
+        let block = file.write(&batch)?;
+        let mut state = self.lock();
+        state.stored_rows += rows;
+        state.stored_bytes += bytes;
+        state.batches.push(StoredBatch { key, rows, bytes, data: BatchData::File(block) });
         Ok(())
     }
 
-    /// Moves the batches kept in memory into a new file. On failure the
-    /// batches stay in memory as the stored prefix.
-    fn spill(&mut self) -> Result<(), LimitReason> {
+    /// Moves the batches kept in memory into a new file. On failure they stay
+    /// in memory as what the result keeps.
+    fn spill(&self, state: &mut WriterState) -> Result<(), LimitReason> {
         let directory = self.store.session_directory().map_err(|_| LimitReason::Io)?;
-        let mut file = SpillFile::create(&directory, &self.id, &self.schema).map_err(|_| LimitReason::Io)?;
-        for batch in &self.memory {
-            if file.writer.write(batch).is_err() {
-                file.discard();
-                return Err(LimitReason::Io);
+        let file = SpillFile::create(&directory, &self.id, &self.schema).map_err(|_| LimitReason::Io)?;
+        let mut blocks = Vec::with_capacity(state.batches.len());
+        for stored in &state.batches {
+            let BatchData::Memory(batch) = &stored.data else {
+                unreachable!("a result without a file keeps its batches in memory")
+            };
+            match file.write(batch) {
+                Ok(block) => blocks.push(block),
+                Err(reason) => {
+                    file.discard();
+                    return Err(reason);
+                }
             }
         }
-        self.memory.clear();
-        self.stored_bytes = file.bytes();
-        self.file = Some(file);
+        for (stored, block) in state.batches.iter_mut().zip(blocks) {
+            stored.data = BatchData::File(block);
+        }
+        state.file = Some(Arc::new(file));
         Ok(())
     }
 
-    /// Stops storing; the rows stored so far remain the result's prefix.
-    pub(crate) fn stop(&mut self, reason: LimitReason) {
-        self.limit_reason.get_or_insert(reason);
+    /// Records that the batch `key` is not stored, which ends storing: the
+    /// result keeps the batches before the first missing one.
+    pub(crate) fn missing(&self, key: BatchKey, reason: LimitReason) {
+        let mut state = self.lock();
+        state.limit_reason.get_or_insert(reason);
+        state.first_missing = Some(state.first_missing.map_or(key, |first| first.min(key)));
+        self.storing.store(false, Ordering::Relaxed);
     }
 
     /// Makes the result readable. `rows` is the number of rows the statement
@@ -735,32 +829,70 @@ impl ResultWriter {
     pub(crate) fn finish(mut self, rows: u64, rows_exact: bool) {
         self.finished = true;
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
-        let data = match self.file.take() {
-            None => StoredData::Memory(std::mem::take(&mut self.memory)),
-            Some(file) => match file.finish() {
-                Ok((path, bytes)) => {
-                    self.stored_bytes = bytes;
-                    StoredData::File(path)
+        let mut state = std::mem::take(&mut *self.lock());
+        state.batches.sort_by_key(|stored| stored.key);
+        if let Some(first_missing) = state.first_missing {
+            let kept = state.batches.partition_point(|stored| stored.key < first_missing);
+            state.batches.truncate(kept);
+        }
+        let mut stored_rows = 0;
+        let mut stored_bytes = 0;
+        let mut batch_ends = Vec::with_capacity(state.batches.len());
+        for stored in &state.batches {
+            stored_rows += stored.rows;
+            stored_bytes += stored.bytes;
+            batch_ends.push(stored_rows);
+        }
+        let mut limit_reason = state.limit_reason;
+        let data = match state.file.take() {
+            None => StoredData::Memory(
+                state
+                    .batches
+                    .into_iter()
+                    .filter_map(|stored| match stored.data {
+                        BatchData::Memory(batch) => Some(batch),
+                        BatchData::File(_) => None,
+                    })
+                    .collect(),
+            ),
+            Some(file) => {
+                let blocks: Vec<Block> = state
+                    .batches
+                    .iter()
+                    .filter_map(|stored| match &stored.data {
+                        BatchData::File(block) => Some(*block),
+                        BatchData::Memory(_) => None,
+                    })
+                    .collect();
+                // Every append has returned, so this is the only reference left.
+                let published = Arc::try_unwrap(file)
+                    .map_err(|_| "the result file is still being written".to_string())
+                    .and_then(|file| file.finish(&self.schema, &blocks));
+                match published {
+                    Ok((path, bytes)) => {
+                        stored_bytes = bytes;
+                        StoredData::File(path)
+                    }
+                    Err(_) => {
+                        stored_rows = 0;
+                        stored_bytes = 0;
+                        batch_ends.clear();
+                        limit_reason = Some(LimitReason::Io);
+                        StoredData::Memory(Vec::new())
+                    }
                 }
-                Err(_) => {
-                    self.stored_rows = 0;
-                    self.stored_bytes = 0;
-                    self.batch_ends.clear();
-                    self.limit_reason = Some(LimitReason::Io);
-                    StoredData::Memory(Vec::new())
-                }
-            },
+            }
         };
         let stored = StoredResult {
             rows,
             rows_exact,
-            stored_rows: self.stored_rows,
-            limit_reason: self.limit_reason,
+            stored_rows,
+            limit_reason,
             elapsed_ms,
-            batch_ends: std::mem::take(&mut self.batch_ends),
+            batch_ends,
             data,
         };
-        self.store.complete(&self.id, stored, self.stored_bytes);
+        self.store.complete(&self.id, stored, stored_bytes);
     }
 }
 
@@ -769,7 +901,8 @@ impl Drop for ResultWriter {
         if self.finished {
             return;
         }
-        if let Some(file) = self.file.take() {
+        let file = self.lock().file.take();
+        if let Some(file) = file.and_then(Arc::into_inner) {
             file.discard();
         }
         self.store.forget(&self.id);
@@ -950,20 +1083,22 @@ pub unsafe extern "C" fn sidequery_result_begin(
 
 #[no_mangle]
 pub unsafe extern "C" fn sidequery_result_append(
-    writer: *mut ResultWriter,
+    writer: *const ResultWriter,
     batch: *mut FFI_ArrowArray,
+    major: u64,
+    minor: u64,
 ) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let writer = unsafe { &mut *writer };
-        writer.append_ffi(unsafe { FFI_ArrowArray::from_raw(batch) })
+        let writer = unsafe { &*writer };
+        writer.append_ffi(unsafe { FFI_ArrowArray::from_raw(batch) }, (major, minor))
     }))
     .unwrap_or(false)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sidequery_result_stop(writer: *mut ResultWriter) {
+pub unsafe extern "C" fn sidequery_result_missing(writer: *const ResultWriter, major: u64, minor: u64) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { &mut *writer }.stop(LimitReason::Io)
+        unsafe { &*writer }.missing((major, minor), LimitReason::Io)
     }));
 }
 

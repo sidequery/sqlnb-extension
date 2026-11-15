@@ -1466,6 +1466,7 @@ dependencies = [
  "arrow-schema",
  "axum",
  "bytes",
+ "flatbuffers",
  "git2",
  "http-body-util",
  "libc",

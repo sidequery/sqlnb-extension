@@ -41,11 +41,15 @@ sidequery_result_writer *sidequery_result_begin(const char *id, const char *meta
                                                 struct ArrowSchema *schema, uint64_t head_rows,
                                                 uint64_t max_result_bytes,
                                                 uint64_t max_cache_bytes, char **error_out);
-// Stores the rows of a struct array whose fields match the schema. Returns
-// false once storing stopped; the rows stored before remain the result.
-bool sidequery_result_append(sidequery_result_writer *writer, struct ArrowArray *batch);
-// Stops storing because the caller could not convert its rows (limit reason "io").
-void sidequery_result_stop(sidequery_result_writer *writer);
+// Stores the rows of a struct array whose fields match the schema, from any
+// thread. The result reads back in the order of the keys (major, then minor),
+// whatever order the batches were stored in. Returns false when the batch was
+// not stored; the result is then the batches before the first one missing.
+bool sidequery_result_append(sidequery_result_writer *writer, struct ArrowArray *batch,
+                             uint64_t major, uint64_t minor);
+// Marks the batch with this key as one the caller could not store (limit
+// reason "io" unless a limit already stopped storing).
+void sidequery_result_missing(sidequery_result_writer *writer, uint64_t major, uint64_t minor);
 // rows counts every row the statement produced; rows_exact is false when the
 // statement stopped reading early and rows is only a lower bound.
 void sidequery_result_finish(sidequery_result_writer *writer, uint64_t rows, bool rows_exact);

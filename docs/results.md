@@ -18,25 +18,47 @@ select * from sqlnb_result_tee(
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
-| first argument | | The statement's rows, as a table. |
+| first argument | | The statement whose result is kept, as a table. |
 | `id` | required | 32 lowercase hexadecimal characters, unique among the process's results. |
-| `head_rows` | 10240 | Rows passed through to the caller. |
-| `head_bytes` | 4 MiB | Arrow buffer bytes passed through to the caller. |
+| `head_rows` | 10240 | Rows returned to the caller. |
+| `head_bytes` | 4 MiB | Arrow buffer bytes returned to the caller. |
 | `meta` | `''` | Caller data returned by `sqlnb_results()`, at most 64 KiB. |
 | `max_result_bytes` | 4 GiB | Bytes stored for this result. |
 | `max_cache_bytes` | 16 GiB | Bytes stored for all results of the process. |
 | `stop_at_limit` | `false` | Stop reading the input once storing stops. |
 
-The tee returns the first rows of its input in chunks of 2048 rows, as soon as
-each chunk is complete, until `head_rows` rows or `head_bytes` bytes have been
-returned; the chunk that crosses `head_bytes` is still returned whole. It keeps
-reading and storing the rest of the input without returning it. One thread runs
-the statement, so rows are stored in the statement's order.
+The tee marks the statement whose result is kept. That statement has to return
+the tee's columns unchanged, as `select * from sqlnb_result_tee(...)` does;
+anything else, such as an aggregate over the tee, `CREATE TABLE AS`, `EXPLAIN`
+or a second tee, is an error before the statement runs.
+
+The statement returns only its first rows: whole chunks, as DuckDB produces
+them, until `head_rows` rows or `head_bytes` bytes have been returned (the chunk
+that crosses either is still returned whole). Every row is stored. The rows
+returned are exactly the first rows stored.
+
+The statement runs as it would without the tee, on all its threads, and each
+thread stores the rows it produces. They are stored in the statement's order:
+the order of an `ORDER BY`, of a table, or of the files and row groups of a
+Parquet scan. Where DuckDB gives a statement's rows no order, such as the
+output of a join or an aggregate, or everything when
+`preserve_insertion_order` is false, they are stored in the order they arrive.
 
 A result becomes readable when its statement finishes. A statement that fails or
-is interrupted leaves nothing behind and frees its id. A `LIMIT` above the tee,
-or anything else that stops reading the tee's output early, ends the statement
-before its input does, so the result is discarded too.
+is interrupted leaves nothing behind and frees its id.
+
+### How the order is kept
+
+DuckDB numbers the batches a parallel scan hands to its threads, and delivers a
+statement's rows in batch order. Each thread stores Arrow batches labelled with
+the executor batch they come from and writes them to the file wherever there is
+room, without waiting for earlier rows. When the statement ends, the file's
+footer lists the batches in executor order, and readers follow the footer.
+
+Only the first rows need their order while the statement still runs. The thread
+on the lowest executor batch returns its rows at once. Every other thread keeps
+a copy of the first rows of its batch, at most `head_rows` rows or `head_bytes`
+bytes, until the batches before it have ended or enough rows were returned.
 
 Results with at most `head_rows` rows and 1 MiB of Arrow buffers stay in memory.
 Larger results are written to `<id>.arrow.tmp` and renamed to `<id>.arrow` once
@@ -47,12 +69,15 @@ whose footer lets a read seek directly to the batches it needs.
 
 When a result would exceed `max_result_bytes`, or the process's results would
 exceed `max_cache_bytes` even after evicting the oldest other results, the tee stops
-storing. The rows stored before then remain readable as a prefix of the result,
-and `limit_reason` says why. The statement still runs to completion, and `rows`
+storing. The result keeps the rows before the first batch that was not stored, a
+prefix of the statement's rows, and `limit_reason` says why. Batches are stored
+whole, and threads store later parts of the result while earlier parts are
+still being produced, so the prefix can be shorter than the limit by what the
+threads had in progress. The statement still runs to completion, and `rows`
 counts every row it produced. Failures to store, such as a full disk or an
 unwritable cache directory, likewise stop storing with `limit_reason = 'io'`; they
 never fail the statement. Limits count Arrow buffer bytes; a file can exceed its
-limit by its footer and the framing of its last batch.
+limit by its footer and the framing of its batches.
 
 With `stop_at_limit := true` the tee also stops reading its input once storing
 stops, as a `LIMIT` would, and publishes the stored prefix. `rows` is then the
@@ -142,10 +167,16 @@ own directory.
 
 ## Storage format
 
-Files are uncompressed Arrow IPC with batches of 8192 rows, or fewer once a
-batch reaches 64 MiB. The first rows reach the caller before anything is written
+Files are uncompressed Arrow IPC with batches of at most 8192 rows; a batch
+ends earlier when it reaches 64 MiB or its thread's executor batch ends. Batches
+are in the file in the order they were written, which is not the result's
+order: read the file through its footer, as `sqlnb_result` and any Arrow file
+reader do, not as a stream.
+
+The first rows reach the caller before anything is written
 to disk, so compression would not change how quickly they appear. Measured on an
-Apple Silicon Mac with a warm page cache, for 5,000,000 rows of `BIGINT`,
+Apple Silicon Mac with a warm page cache, with one thread storing the result,
+for 5,000,000 rows of `BIGINT`,
 `DECIMAL`, `VARCHAR` and `TIMESTAMP WITH TIME ZONE` (medians of three runs):
 
 | | Uncompressed | LZ4 frames |
