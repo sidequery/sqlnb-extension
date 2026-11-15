@@ -22,7 +22,7 @@ make test
 
 The SQL tests start the server with a small local UI fixture, exercise MCP owner
 isolation and shutdown, and verify invalid startup options and disabled external
-access. They install runtime dependencies from DuckDB's core repository; they
+access. A separate file covers the [result cache](results.md). They install runtime dependencies from DuckDB's core repository; they
 do not need a Sidequery repository registration or the hosted UI.
 
 The [community workflow](../.github/workflows/community.yml) uses DuckDB's reusable
