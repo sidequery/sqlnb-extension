@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -184,10 +185,15 @@ function runSQL(sql) {
 // For a result of more than one row: the CLI prints one row per line, and
 // runSQL reads a line.
 async function runRows(sql) {
-  const file = join(mkdtempSync(join(tmpdir(), 'sidequery-ui-rows.')), 'rows.json');
-  child.stdin.write(`.once ${file}\n${sql};\n`);
-  await runSQL('select 1 as done');
-  return JSON.parse(readFileSync(file, 'utf8'));
+  const directory = mkdtempSync(join(tmpdir(), 'sidequery-ui-rows.'));
+  const file = join(directory, 'rows.json');
+  try {
+    child.stdin.write(`.once ${file}\n${sql};\n`);
+    await runSQL('select 1 as done');
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 // For a statement whose own output is not a row to assert on.
@@ -770,7 +776,8 @@ if (hasResultCache) {
   // order: a scan with a filter, a sort, several Parquet files, and a verified
   // read stopped at the limit while many threads store.
   await runStatement('create table tee_scan as select i, hash(i) as h from range(3000000) t(i)');
-  const parquet = join(mkdtempSync(join(tmpdir(), 'sidequery-ui-results.')), 'part');
+  const parquetDirectory = mkdtempSync(join(tmpdir(), 'sidequery-ui-results.'));
+  const parquet = join(parquetDirectory, 'part');
   for (const part of [0, 1, 2]) {
     await runStatement(`copy (select i from range(${part * 400000}, ${(part + 1) * 400000}) t(i)) to ${sqlLiteral(`${parquet}${part}.parquet`)} (row_group_size 50000)`);
   }
@@ -815,6 +822,7 @@ if (hasResultCache) {
     assert.equal(firstValue(await runSQL(`select sqlnb_result_drop('${resultId(number)}')`)), true);
   }
   await runStatement('drop table tee_scan');
+  rmSync(parquetDirectory, { recursive: true, force: true });
   // The agent connection cannot reach the cache, on either SQL tool.
   for (const sql of [
     'select * from sqlnb_results()',
