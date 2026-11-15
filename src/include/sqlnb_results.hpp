@@ -119,6 +119,8 @@ struct TeeParameters {
   bool stop_at_limit;
   vector<LogicalType> types;
   vector<string> names;
+  // The statement made its result readable.
+  atomic<bool> published {false};
 };
 
 struct TeeBindData : public TableFunctionData {
@@ -153,7 +155,13 @@ public:
     previous = nullptr;
   }
 
-  void QueryEnd(ClientContext &context) override {
+  void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+    if (error && error->HasError() && parameters && parameters->published) {
+      // The statement failed after its last pipeline had finished: DuckDB
+      // raises an interrupt that arrives while that pipeline finalizes only
+      // afterwards. A failed statement leaves no result.
+      sidequery_result_drop(parameters->id.c_str());
+    }
     Unhook(context);
     parameters.reset();
     collecting = false;
@@ -303,15 +311,19 @@ public:
 
 // Makes a statement's result readable, as the last thing its last pipeline
 // does. The wrapped collector may finish its own work in events it inserts
-// while it finalizes: Quack sends a result's last batches from one, which
+// while it finalizes: Quack can send a result's last batches from one, which
 // waits for the client and fails when the client is gone. A statement that
 // fails there has failed, and leaves no result. This event is inserted before
 // the wrapped collector finalizes, which puts it after every event inserted
-// later (Event::InsertEvent), so it only runs once those have finished.
+// later (Event::InsertEvent), so it only runs once those have finished. A
+// statement that still fails after this event is handled when it ends
+// (TeeStatement::QueryEnd).
 class TeePublishEvent : public BasePipelineEvent {
 public:
-  TeePublishEvent(Pipeline &pipeline, TeeGlobalState &global_p, bool rows_exact_p)
-      : BasePipelineEvent(pipeline), global(global_p), rows_exact(rows_exact_p) {
+  TeePublishEvent(Pipeline &pipeline, TeeGlobalState &global_p, shared_ptr<TeeParameters> parameters_p,
+                  bool rows_exact_p)
+      : BasePipelineEvent(pipeline), global(global_p), parameters(std::move(parameters_p)),
+        rows_exact(rows_exact_p) {
   }
 
   void Schedule() override {
@@ -321,11 +333,13 @@ public:
     if (global.writer) {
       sidequery_result_finish(global.writer, global.rows, rows_exact);
       global.writer = nullptr;
+      parameters->published = true;
     }
   }
 
 private:
   TeeGlobalState &global;
+  const shared_ptr<TeeParameters> parameters;
   const bool rows_exact;
 };
 
@@ -489,7 +503,8 @@ public:
       // Every thread has combined, so the counts are final. A wrapped
       // collector that blocks is finalized again with the same event.
       global.publish_scheduled = true;
-      event.InsertEvent(make_shared_ptr<TeePublishEvent>(pipeline, global, !StoppedAtLimit(global)));
+      event.InsertEvent(
+          make_shared_ptr<TeePublishEvent>(pipeline, global, parameters, !StoppedAtLimit(global)));
     }
     OperatorSinkFinalizeInput inner {*global.inner, input.interrupt_state};
     return BASE::Finalize(pipeline, event, context, inner);
