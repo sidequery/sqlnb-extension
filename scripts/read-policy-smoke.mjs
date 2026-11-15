@@ -94,6 +94,10 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
     attach ${sqlLiteral(servedDatabase)} as local_file_db (read_only);
     attach ${sqlLiteral(remoteDatabase)} as remote_file_db (read_only);
     create view policy.remote_file_view as select fact from remote_file_db.facts;
+    -- Sampled previews: only tables of at least 1,000,000 rows are sampled.
+    create table policy.big as select i::integer as id, (i % 7)::integer as grp from range(1200000) as r(i);
+    create view policy.big_view as select id from policy.big;
+    create view policy.sampled_view as select id from policy.items using sample 50%;
     select nextval('policy.counter') as initialized`);
   for (let level = 0; level <= 8; level += 1) {
     const source = level === 0 ? 'policy.items' : `policy.depth_${level - 1}`;
@@ -248,6 +252,73 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
   await accepts('select count(*)::integer as n from repeat(7, 3)', [{ n: 3 }]);
   await refuses('select * from policy.items at (version => 1)', 'AT \\(time travel\\) clauses');
   await refuses('select * from (pivot policy.items on grp using sum(id))', 'statements that DuckDB expands into several statements');
+
+  // 5. Sampled previews. The plan is a hint; sqlnb_read_query verifies the
+  // statement again and applies a seeded Bernoulli sample to the verified tree.
+  const database = firstValue(await runSQL('select current_database() as name'));
+  const plan = async (sql) => {
+    const value = firstValue(await runSQL(`select sqlnb_sample_plan(${sqlLiteral(sql)}) as plan`));
+    return value === null ? null : JSON.parse(value);
+  };
+  const sampleArguments = (table, percent, catalog = database, schema = 'policy') =>
+    `sample_catalog := ${sqlLiteral(catalog)}, sample_schema := ${sqlLiteral(schema)}, ` +
+    `sample_table := ${sqlLiteral(table)}, sample_percent := ${percent}`;
+  const sampled = async (sql, table, percent) => (await runSQL(
+    `select count(*)::integer as rows, sum(id)::bigint as total from sqlnb_read_query(${sqlLiteral(sql)}, ${sampleArguments(table, percent)})`,
+  ))[0];
+  async function refusesSampled(sql, reason, table = 'big', percent = 10) {
+    await expectSQLError(
+      `select * from sqlnb_read_query(${sqlLiteral(sql)}, ${sampleArguments(table, percent)})`,
+      new RegExp(`SQLNB_READ_ONLY: ${reason}`),
+    );
+  }
+
+  assert.deepEqual(await plan('select count(*) from policy.big'), {
+    catalog: database, schema: 'policy', table: 'big', rows: 1200000, percent: 10, method: 'bernoulli',
+  });
+  // One relation is sampled; the other inputs of a join are read in full.
+  assert.equal((await plan('select count(*) from policy.big join policy.items using (id)'))?.table, 'big');
+  assert.equal((await plan('with b as (select id from policy.big) select max(id) from b'))?.table, 'big');
+  for (const exact of [
+    'select count(*) from policy.items',
+    'select count(*) from policy.big a join policy.big b using (id)',
+    'select count(*) from policy.big_view',
+    'select count(*) from policy.big join policy.big_view using (id)',
+    'select count(*) from policy.big using sample 1%',
+    'select count(*) from policy.big tablesample 1%',
+    'select count(*) from (select id from policy.big) using sample 1%',
+    'select count(*) from policy.big join policy.sampled_view using (id)',
+    'insert into policy.items select id, 0, \'x\', null, null from policy.big',
+    'select nextval(\'policy.counter\'), id from policy.big',
+    `select * from policy.big, read_csv(${sqlLiteral(remoteCSV)})`,
+  ]) {
+    assert.equal(await plan(exact), null, exact);
+  }
+
+  const first = await sampled('select id from policy.big', 'big', 10);
+  assert.ok(first.rows > 110000 && first.rows < 130000, `a 10% sample of 1,200,000 rows kept ${first.rows}`);
+  assert.deepEqual(await sampled('select id from policy.big', 'big', 10), first, 'the fixed seed repeats the sample');
+  assert.deepEqual(await sampled('select id from policy.big where id >= 0', 'big', 10), first, 'filters see the same sample');
+  const joined = (await runSQL(
+    `select count(*)::integer as rows from sqlnb_read_query('select id from policy.big join policy.items using (id)', ${sampleArguments('big', 10)})`,
+  ))[0].rows;
+  assert.ok(joined <= 4, 'only the sampled table loses rows in a join');
+
+  // Sampling never widens what the policy accepts.
+  await refusesSampled('insert into policy.big values (1, 1)', 'Instant SQL does not preview INSERT statements');
+  await refusesSampled('select nextval(\'policy.counter\'), id from policy.big', 'Instant SQL does not preview the function \'nextval\'');
+  await refusesSampled(`select * from read_csv(${sqlLiteral(remoteCSV)})`, 'Instant SQL does not preview the table function \'read_csv\'');
+  await refusesSampled('select fact from remote_file_db.facts', 'Instant SQL does not preview .*stored at a remote location', 'facts');
+  // A sample applies only to the statement's sole read of a large table.
+  await refusesSampled('select id from policy.items', 'Instant SQL does not preview a sample of .*policy.big\', which must be this statement\'s only read');
+  await refusesSampled('select count(*) from policy.big a join policy.big b using (id)', 'Instant SQL does not preview a sample of .*which must be this statement\'s only read');
+  await refusesSampled('select count(*) from policy.big_view', 'Instant SQL does not preview a sample of .*which must be this statement\'s only read');
+  await refusesSampled('select count(*) from policy.big tablesample 1%', 'Instant SQL does not preview a sample of .*which must be this statement\'s only read');
+  await refusesSampled('select id from policy.big', 'Instant SQL does not preview a sample of 100', 'big', 100);
+  await expectSQLError(
+    'select * from sqlnb_read_query(\'select id from policy.big\', sample_table := \'big\')',
+    /SQLNB_READ_ONLY: a sampled preview needs a catalog, schema, table and percent/,
+  );
 
   assert.equal(await sequenceValue(), 1, 'refused statements must not advance sequences');
   assert.equal(await policyRows(), 4, 'refused statements must not write rows');

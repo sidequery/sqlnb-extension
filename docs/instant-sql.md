@@ -123,6 +123,59 @@ finish in tens of milliseconds on current hardware; unbounded shapes such as
 `count(*)` over `range(1e12)` stop at the budget. Aggregates that build one large
 value (`string_agg` or `list` over a large input) are bounded only by that time.
 
+## Sampled previews
+
+The notebook offers an opt-in setting, "Instant SQL previews: Sampled
+(approximate)". With it, a preview that the exact path cannot finish quickly runs
+on a sample of one table instead. Previews are exact by default.
+
+- `sqlnb_sample_plan(sql)` returns JSON naming the table a sampled preview would
+  sample and the percentage, for example
+  `{"catalog":"big","schema":"main","table":"f","rows":50000000,"percent":0.2,"method":"bernoulli"}`,
+  or `NULL` when the preview stays exact or the policy refuses the statement. Like
+  `sqlnb_is_read_only`, it is a hint.
+- `sqlnb_read_query(sql, sample_catalog := …, sample_schema := …, sample_table := …,
+  sample_percent := …)` verifies the statement exactly as above, then puts a
+  Bernoulli sample with a fixed seed on the verified reference to that table and
+  binds the rewritten statement. It refuses the sample, with the reason, unless
+  that table is still the statement's sample candidate. Sampling never changes
+  what the policy accepts.
+- The candidate is the statement's largest table, and only when it has at least
+  1,000,000 rows, the whole statement (including the views it reads) reads it
+  exactly once and directly in the statement rather than inside a view, and
+  nothing in the statement or its views already samples (`TABLESAMPLE`,
+  `USING SAMPLE`). One table is sampled; the other inputs of a join are read in
+  full, so the disclosed percentage is the one applied.
+- The percentage is the largest of 10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01,
+  0.005, 0.002 and 0.001 percent that keeps at least 100,000 expected rows: 10%
+  of 1,200,000 rows, 0.2% of 50,000,000.
+- The seed is fixed (42), so the same statement samples the same rows on every
+  pause in typing, in memory, in attached files and in Parquet-backed tables
+  alike. A sample on a base table applies before `WHERE`.
+
+The method was chosen by measurement on DuckDB 2.0.0 (36-core M5 Ultra, a
+50,000,000-row table in an attached database file):
+
+| Shape, 4 threads | Exact | Seeded Bernoulli | Unseeded Bernoulli | `SYSTEM` |
+| --- | --- | --- | --- | --- |
+| Full-table window function | 2.53 s | 0.95 s | 0.30 s | n/a |
+| Aggregate over 200,000 groups | 0.38 s | 0.85 s | 0.24 s | n/a |
+| Aggregate | 0.53 s | 0.92 s | n/a | 0.03 s |
+| Top-N | 0.03 s | 0.88 s | n/a | 0.03 s |
+
+- Seeded Bernoulli is repeatable but runs on one thread: about 0.9 s per
+  50,000,000 rows at any thread count. It beats the exact preview only for shapes
+  that are slow exactly, which is why the notebook tries the exact preview first
+  and samples only when that does not finish within one second. Above about
+  110,000,000 rows the sampled scan itself exceeds the 2-second budget.
+- Unseeded Bernoulli is parallel but samples different rows each time, so a
+  preview would change on every pause.
+- `SYSTEM` sampling keeps or drops whole vectors of 2,048 rows. Even with a seed
+  it was not repeatable (38,912 and 59,392 rows for the same 1% sample of
+  5,000,000 rows), drew those rows from 19 to 29 vectors where Bernoulli spread
+  over all 2,442, and returned no rows from a 500-row table. It is not used.
+- `RESERVOIR` sampling is repeatable but needs the whole input (about 1.2 s).
+
 ## Tests
 
 [`read-policy-smoke.mjs`](../scripts/read-policy-smoke.mjs) runs inside the

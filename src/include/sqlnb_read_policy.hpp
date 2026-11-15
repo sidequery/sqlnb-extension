@@ -27,6 +27,8 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -57,9 +59,22 @@ static constexpr idx_t MAX_VIEW_DEPTH = 8;
 //! Bounds the total number of view bodies verified for one statement, so views
 //! that share (diamond) references cannot make verification exponential.
 static constexpr idx_t MAX_VIEW_EXPANSIONS = 64;
+//! Sampled previews leave smaller tables exact: below this an exact preview is
+//! already fast, and a sample would be a large share of the table anyway.
+static constexpr idx_t MIN_SAMPLE_ROWS = 1000000;
+//! A sampled preview keeps about this many rows of the sampled table.
+static constexpr idx_t SAMPLE_TARGET_ROWS = 100000;
+//! Fixed so the same statement samples the same rows on every pause in typing.
+static constexpr idx_t SAMPLE_SEED = 42;
 
 class Policy {
 public:
+  struct TableUse {
+    optional_ptr<TableCatalogEntry> table;
+    //! The reference in the verified statement; null inside a view definition.
+    optional_ptr<BaseTableRef> reference;
+  };
+
   //! `outer_binder` is the binder that will bind the returned statement. Its
   //! catalog search path and the CTEs of the query around it apply to the
   //! statement, so verification uses them too.
@@ -94,7 +109,89 @@ public:
     return statement;
   }
 
+  //! The table a sampled preview reads a Bernoulli sample of: the verified
+  //! statement's largest table, when it has at least MIN_SAMPLE_ROWS rows and
+  //! the whole statement (including the views it reads) reads it exactly once,
+  //! directly, and has no sample clause anywhere: a sample of a sample would
+  //! disclose a percentage that was not the one applied. Sampling one table only
+  //! keeps the disclosure exact: in a join, the rows of that table are sampled
+  //! and every other input is read in full. Call after Parse.
+  struct SamplePlan {
+    string catalog;
+    string schema;
+    string table;
+    idx_t rows = 0;
+    double percent = 0;
+  };
+  optional_ptr<TableUse> SampleCandidate() {
+    optional_ptr<TableUse> largest;
+    idx_t largest_rows = 0;
+    for (auto &use : table_uses) {
+      auto rows = TableRows(*use.table);
+      if (!largest || rows > largest_rows) {
+        largest = &use;
+        largest_rows = rows;
+      }
+    }
+    if (!largest || largest_rows < MIN_SAMPLE_ROWS || !largest->reference || has_sample_clause) return nullptr;
+    for (auto &use : table_uses) {
+      if (&use != largest.get() && use.table.get() == largest->table.get()) return nullptr;
+    }
+    return largest;
+  }
+
+  bool PlanSample(SamplePlan &plan) {
+    auto use = SampleCandidate();
+    if (!use) return false;
+    plan.catalog = use->table->ParentCatalog().GetName().GetIdentifierName();
+    plan.schema = use->table->ParentSchema().name.GetIdentifierName();
+    plan.table = use->table->name.GetIdentifierName();
+    plan.rows = TableRows(*use->table);
+    plan.percent = SamplePercent(plan.rows);
+    return true;
+  }
+
+  //! Applies a Bernoulli sample of `percent` with a fixed seed to the table the
+  //! plan named, in the verified statement that is then bound. Refuses when that
+  //! table is no longer the statement's sample candidate.
+  void ApplySample(const string &catalog, const string &schema, const string &table, double percent) {
+    if (!(percent > 0 && percent < 100)) Refuse("a sample of " + to_string(percent) + "% (it must be between 0 and 100)");
+    auto use = SampleCandidate();
+    if (!use || use->table->ParentCatalog().GetName().GetIdentifierName() != catalog ||
+        use->table->ParentSchema().name.GetIdentifierName() != schema || use->table->name.GetIdentifierName() != table) {
+      Refuse("a sample of " + Quote(catalog + "." + schema + "." + table) +
+             ", which must be this statement's only read of a table of at least 1,000,000 rows, in a statement without a sample clause");
+    }
+    auto sample = make_uniq<SampleOptions>();
+    sample->sample_size = Value::DOUBLE(percent);
+    sample->is_percentage = true;
+    sample->method = SampleMethod::BERNOULLI_SAMPLE;
+    sample->SetSeed(SAMPLE_SEED);
+    sample->repeatable = true;
+    use->reference->sample = std::move(sample);
+  }
+
 private:
+  static idx_t TableRows(TableCatalogEntry &table) {
+    try {
+      return table.GetStorage().GetTotalRows();
+    } catch (const Exception &) {
+      return 0;
+    }
+  }
+
+  //! The largest of 10, 5, 2, 1, 0.5, ... 0.001 percent that keeps at least
+  //! SAMPLE_TARGET_ROWS rows, so the disclosed percentage is a round number.
+  static double SamplePercent(idx_t rows) {
+    static const double ladder[] = {10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001};
+    double percent = ladder[0];
+    for (auto candidate : ladder) {
+      if (double(rows) * candidate / 100 < double(SAMPLE_TARGET_ROWS)) break;
+      percent = candidate;
+    }
+    return percent;
+  }
+
   [[noreturn]] void Refuse(const string &reason) const {
     string message = "SQLNB_READ_ONLY: Instant SQL does not preview " + reason;
     if (!view_path.empty()) message += " (inside view " + StringUtil::Join(view_path, " > ") + ")";
@@ -610,9 +707,15 @@ private:
              "scans need Run)");
     }
     CheckRelation(*entry, display);
+    if (entry->type == CatalogType::TABLE_ENTRY) {
+      // References inside view definitions are verified on a copy and bound
+      // from the catalog later, so they count but can never be sampled.
+      table_uses.push_back({&entry->Cast<TableCatalogEntry>(), view_path.empty() ? &table : nullptr});
+    }
   }
 
   void CheckTable(TableRef &reference) {
+    if (reference.sample) has_sample_clause = true;
     switch (reference.type) {
     case TableReferenceType::EMPTY_FROM:
       return;
@@ -669,6 +772,7 @@ private:
     switch (node.type) {
     case QueryNodeType::SELECT_NODE: {
       auto &select = node.Cast<SelectNode>();
+      if (select.sample) has_sample_clause = true;
       for (auto &expression : select.select_list) CheckExpression(*expression);
       for (auto &expression : select.groups.group_expressions) CheckExpression(*expression);
       if (select.where_clause) CheckExpression(*select.where_clause);
@@ -707,6 +811,10 @@ private:
   idx_t cte_floor = 0;
   vector<string> view_path;
   idx_t view_expansions = 0;
+  //! Every read of a table, in the statement and in the views it reads.
+  vector<TableUse> table_uses;
+  //! Whether the statement or a view it reads already samples anything.
+  bool has_sample_clause = false;
 };
 
 static void IsReadOnly(DataChunk &input, ExpressionState &state, Vector &result) {
@@ -720,11 +828,70 @@ static void IsReadOnly(DataChunk &input, ExpressionState &state, Vector &result)
   });
 }
 
+static string JSONString(const string &value) {
+  string out = "\"";
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += char(c);
+    } else if (c < 0x20) {
+      static const char *hex = "0123456789abcdef";
+      out += "\\u00";
+      out += hex[c >> 4];
+      out += hex[c & 15];
+    } else {
+      out += char(c);
+    }
+  }
+  return out + "\"";
+}
+
+//! A hint for the notebook: which table a sampled preview of this statement
+//! would sample and at what percentage, as JSON, or NULL when it would stay
+//! exact (or the policy refuses it). Never an authorization: sqlnb_read_query
+//! verifies again and applies only a sample that still matches.
+static void SamplePlanFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+  UnaryExecutor::Execute<string_t, string_t>(input.data[0], result, input.size(),
+    [&](string_t sql) -> optional<string_t> {
+      Policy::SamplePlan plan;
+      bool planned = false;
+      try {
+        Policy policy(state.GetContext());
+        policy.Parse(sql.GetString());
+        planned = policy.PlanSample(plan);
+      } catch (const Exception &) {
+        planned = false;
+      }
+      if (!planned) return optional<string_t>();
+      auto json = "{\"catalog\":" + JSONString(plan.catalog) + ",\"schema\":" + JSONString(plan.schema) +
+                  ",\"table\":" + JSONString(plan.table) + ",\"rows\":" + to_string(plan.rows) +
+                  ",\"percent\":" + Value::DOUBLE(plan.percent).ToString() + ",\"method\":\"bernoulli\"}";
+      return StringVector::AddString(result, json);
+    });
+}
+
 static unique_ptr<TableRef> ReadQuery(ClientContext &context, TableFunctionBindInput &input) {
   if (input.inputs[0].IsNull()) throw InvalidInputException("SQLNB_READ_ONLY: SQL cannot be null");
   // Validate and return the same parsed tree, in the outer query's binding
   // transaction. A separate prior classification cannot authorize this path.
-  return make_uniq<SubqueryRef>(Policy(context, input.binder).Parse(input.inputs[0].GetValue<string>()));
+  Policy policy(context, input.binder);
+  auto statement = policy.Parse(input.inputs[0].GetValue<string>());
+  // A sampled preview names the table and percentage it asked for, so what it
+  // discloses is exactly what is applied; the sample goes on the verified tree.
+  static const char *sample_parameters[] = {"sample_catalog", "sample_schema", "sample_table", "sample_percent"};
+  idx_t given = 0;
+  for (auto name : sample_parameters) {
+    auto entry = input.named_parameters.find(name);
+    if (entry != input.named_parameters.end() && !entry->second.IsNull()) given++;
+  }
+  if (given != 0) {
+    if (given != 4) throw InvalidInputException("SQLNB_READ_ONLY: a sampled preview needs a catalog, schema, table and percent");
+    policy.ApplySample(input.named_parameters["sample_catalog"].GetValue<string>(),
+                       input.named_parameters["sample_schema"].GetValue<string>(),
+                       input.named_parameters["sample_table"].GetValue<string>(),
+                       input.named_parameters["sample_percent"].GetValue<double>());
+  }
+  return make_uniq<SubqueryRef>(std::move(statement));
 }
 
 } // namespace sqlnb_read_policy
@@ -733,8 +900,17 @@ static void RegisterSQLNBReadPolicy(ExtensionLoader &loader) {
   ScalarFunction policy("sqlnb_is_read_only", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, sqlnb_read_policy::IsReadOnly);
   policy.SetVolatile();
   loader.RegisterFunction(policy);
+  ScalarFunction plan("sqlnb_sample_plan", {LogicalType::VARCHAR}, LogicalType::VARCHAR, sqlnb_read_policy::SamplePlanFunction);
+  plan.SetVolatile();
+  loader.RegisterFunction(plan);
   TableFunction read("sqlnb_read_query", {LogicalType::VARCHAR}, nullptr, nullptr);
   read.bind_replace = sqlnb_read_policy::ReadQuery;
+  read.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+    options.Add("sample_catalog", LogicalType::VARCHAR)
+        .Add("sample_schema", LogicalType::VARCHAR)
+        .Add("sample_table", LogicalType::VARCHAR)
+        .Add("sample_percent", LogicalType::DOUBLE);
+  });
   loader.RegisterFunction(read);
 }
 } // namespace duckdb
