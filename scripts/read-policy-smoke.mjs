@@ -243,6 +243,9 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
   );
   await refuses('select list_transform([1], x -> x + 1)', 'the function \'list_transform\'');
   await refuses('select random()', 'the function \'random\'');
+  // A single scalar call can build a value of any size; the table function is row-bounded.
+  await refuses('select repeat(\'x\', 1000000000)', 'the function \'repeat\'');
+  await accepts('select count(*)::integer as n from repeat(7, 3)', [{ n: 3 }]);
   await refuses('select * from policy.items at (version => 1)', 'AT \\(time travel\\) clauses');
   await refuses('select * from (pivot policy.items on grp using sum(id))', 'statements that DuckDB expands into several statements');
 

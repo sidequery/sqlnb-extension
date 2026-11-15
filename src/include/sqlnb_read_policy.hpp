@@ -153,11 +153,15 @@ private:
   }
 
   static const unordered_set<string> &ScalarAllowlist() {
+    // The scalar repeat(string, n) is absent on purpose: one call builds a
+    // value of any size within the preview time budget, and the result byte
+    // cap applies only after the server has serialized it. The repeat table
+    // function stays: its rows are bounded by the row limit and the budget.
     static const unordered_set<string> scalars = {
       "+", "-", "*", "/", "//", "%", "**", "||", "abs", "ceil", "ceiling", "floor", "round", "trunc",
       "sqrt", "pow", "power", "exp", "ln", "log", "log10", "sign", "greatest", "least",
       "lower", "upper", "length", "char_length", "octet_length", "trim", "ltrim", "rtrim", "substring",
-      "substr", "left", "right", "replace", "repeat", "concat", "concat_ws", "starts_with", "ends_with", "contains",
+      "substr", "left", "right", "replace", "concat", "concat_ws", "starts_with", "ends_with", "contains",
       "like_escape", "not_like_escape", "ilike_escape", "not_ilike_escape", "regexp_matches", "regexp_full_match",
       // Operators parse to these function names and bind like any function, so
       // a macro of the same name on the search path would replace them:

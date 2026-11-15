@@ -97,7 +97,9 @@ built-in name is refused.
   (`read_csv`, `read_parquet`, `glob`, `query`, `duckdb_*`), table macros and
   `PIVOT`/`UNPIVOT`, `DESCRIBE`, `SHOW` and `SUMMARIZE` in `FROM`.
 - Functions outside the allowlist, including volatile or state-changing ones such
-  as `nextval`, `setval` and `random`; user-defined functions; macros, whose bodies
+  as `nextval`, `setval` and `random`, and the scalar `repeat(string, n)`, which
+  can build a value of any size in one call (the `repeat` table function is
+  accepted: its rows are bounded); user-defined functions; macros, whose bodies
   are not verified; qualified and method-style calls such as `schema.f()` or
   `x.lower()`.
 - Casts to user-defined, extension (`JSON`, `GEOMETRY`) or other unlisted types
@@ -109,6 +111,17 @@ built-in name is refused.
   more than 64 views.
 - A name that the surrounding query defines as a CTE, and any statement while a
   loaded extension rewrites column names during binding.
+
+## Cost
+
+The policy bounds what a preview can do, not how long it runs. The notebook
+host bounds that: it fetches at most 200 rows or 1 MiB, and interrupts a preview
+that has executed for 2 seconds (Quack `CANCEL_REQUEST` for that query's own id),
+showing "Preview stopped after 2,000 ms. Use Run." An explicit Run never has
+this budget. Aggregates and window functions over hundreds of millions of rows
+finish in tens of milliseconds on current hardware; unbounded shapes such as
+`count(*)` over `range(1e12)` stop at the budget. Aggregates that build one large
+value (`string_agg` or `list` over a large input) are bounded only by that time.
 
 ## Tests
 
