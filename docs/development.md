@@ -41,6 +41,17 @@ mbx test --manifest-path http/Cargo.toml --locked -- --test-threads=1
 place. The release build also runs the ignored deployed-UI check, which requires
 network access.
 
+## System libraries
+
+SQLNB has to load into a DuckDB process that has loaded nothing else, so every
+system library its Rust code calls is named in `CMakeLists.txt`. The runtime
+smoke test loads the extension alone in a fresh process to check this. The
+Arrow crates read the local time zone's name through `iana-time-zone`: on Apple
+platforms that calls CoreFoundation, which is linked as a framework; on Linux it
+reads files and needs no library; on Windows it calls the Windows Runtime
+through `windows-core`, which declares its imports itself (`raw-dylib`) instead
+of relying on an import library.
+
 ## DuckDB 2.0 on macOS
 
 Install Rust 1.99.0 through rustup, have Curl, Perl, and Make available, and supply

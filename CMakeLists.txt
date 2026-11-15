@@ -74,7 +74,9 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   add_dependencies(${target} sidequery_http_build)
   target_link_libraries(${target} sidequery_http OpenSSL::Crypto ZLIB::ZLIB Threads::Threads ${CMAKE_DL_LIBS})
   if(APPLE)
-    target_link_libraries(${target} iconv)
+    # The Arrow crates read the local time zone name (chrono's clock feature,
+    # through iana-time-zone), which calls CoreFoundation on Apple platforms.
+    target_link_libraries(${target} iconv "-framework CoreFoundation")
   elseif(UNIX)
     target_link_libraries(${target} rt util m)
   elseif(WIN32)
