@@ -20,6 +20,8 @@
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/path.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -512,6 +514,7 @@ private:
     if (catalog_type != "duckdb") {
       Refuse(display + " from an attached " + Quote(catalog_type) + " database (only native DuckDB tables are previewed)");
     }
+    CheckLocalStorage(entry.ParentCatalog(), display);
     if (entry.type == CatalogType::TABLE_ENTRY) {
       auto &table = entry.Cast<TableCatalogEntry>();
       // Generated columns are expressions DuckDB binds from the table definition.
@@ -529,6 +532,24 @@ private:
       return;
     }
     Refuse(display + ", which is not a table or view");
+  }
+
+  //! A native DuckDB database file can be attached from a URL (http, s3, hf, ...)
+  //! and still reports the catalog type "duckdb"; reading it issues network
+  //! requests. Only in-memory databases and files on a local path are previewed.
+  void CheckLocalStorage(Catalog &catalog, const string &display) {
+    if (catalog.InMemory()) return;
+    const auto path = catalog.GetDBPath();
+    bool local = false;
+    try {
+      local = !FileSystem::IsRemoteFile(path) && Path::FromString(path).IsLocal();
+    } catch (const Exception &) {
+      local = false;
+    }
+    if (!local) {
+      Refuse(display + " from the database " + Quote(catalog.GetName().GetIdentifierName()) +
+             ", which is stored at a remote location (previews never read over the network)");
+    }
   }
 
   //! Applies this policy to the view's definition, binding names the way

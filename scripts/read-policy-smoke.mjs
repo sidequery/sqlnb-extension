@@ -5,22 +5,41 @@
 // shapes must name their reason and must leave no trace: sequences, tables,
 // files and the HTTP server below observe every side effect they could cause.
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firstValue }) {
+  const scratch = mkdtempSync(join(tmpdir(), 'sqlnb-read-policy.'));
+  const copyTarget = join(scratch, 'copy.csv');
+  const servedDatabase = join(scratch, 'served.duckdb');
   let remoteRequests = 0;
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
     remoteRequests += 1;
-    response.writeHead(200, { 'content-type': 'text/csv' });
-    response.end('value\n1\n');
+    if (!request.url.endsWith('.duckdb')) {
+      response.writeHead(200, { 'content-type': 'text/csv' });
+      response.end('value\n1\n');
+      return;
+    }
+    // A DuckDB database file, served with the HEAD and range support httpfs uses.
+    const body = readFileSync(servedDatabase);
+    const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
+    if (request.method === 'HEAD' || !range) {
+      response.writeHead(200, { 'content-length': body.length, 'accept-ranges': 'bytes' });
+      response.end(request.method === 'HEAD' ? undefined : body);
+      return;
+    }
+    const start = Number(range[1]);
+    const end = range[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
+    response.writeHead(206, {
+      'content-range': `bytes ${start}-${end}/${body.length}`, 'content-length': end - start + 1, 'accept-ranges': 'bytes',
+    });
+    response.end(body.subarray(start, end + 1));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const remoteCSV = `http://127.0.0.1:${server.address().port}/remote.csv`;
-  const scratch = mkdtempSync(join(tmpdir(), 'sqlnb-read-policy.'));
-  const copyTarget = join(scratch, 'copy.csv');
+  const remoteDatabase = `http://127.0.0.1:${server.address().port}/served.duckdb`;
 
   // The CLI harness reads one output line per statement, so the rows travel
   // as one list value. Aggregation does not promise order: compare as a set.
@@ -68,6 +87,13 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
     create table main.trap_name as select 1::integer as value;
     create view policy_db.inner_schema.trap_name as select * from read_csv(${sqlLiteral(remoteCSV)});
     create view policy_db.inner_schema.trap_view as select * from trap_name;
+    attach ${sqlLiteral(servedDatabase)} as served_source;
+    create table served_source.facts as select 7::integer as fact;
+    detach served_source;
+    -- The same file attached from disk and over HTTP: both are native DuckDB catalogs.
+    attach ${sqlLiteral(servedDatabase)} as local_file_db (read_only);
+    attach ${sqlLiteral(remoteDatabase)} as remote_file_db (read_only);
+    create view policy.remote_file_view as select fact from remote_file_db.facts;
     select nextval('policy.counter') as initialized`);
   for (let level = 0; level <= 8; level += 1) {
     const source = level === 0 ? 'policy.items' : `policy.depth_${level - 1}`;
@@ -151,6 +177,7 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
     'select policy_db.inner_schema.remote_name.answer from policy_db.inner_schema.remote_name',
     [{ answer: 42 }],
   );
+  await accepts('select fact from local_file_db.facts', [{ fact: 7 }]);
 
   // 4. Refusals, each with its reason and without side effects.
   await refuses('insert into policy.items values (9, 1, \'x\', null, null)', 'INSERT statements');
@@ -201,6 +228,9 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
   await refuses('select * from policy.remote_view_view', 'the table function \'read_csv\'.*inside view .* > ');
   await refuses('select * from policy.glob_view', 'the table function \'glob\'.*inside view');
   await refuses('select count(*) from policy.depth_8', 'the view .*more than 8 levels deep');
+  // A DuckDB file attached over HTTP is still a "duckdb" catalog; reading it is network I/O.
+  await refuses('select fact from remote_file_db.facts', '\'remote_file_db.facts\' from the database \'remote_file_db\', which is stored at a remote location');
+  await refuses('select fact from policy.remote_file_view', '\'remote_file_db.facts\' .*which is stored at a remote location.*inside view');
   await refuses(
     'with recursive r(n) as (select 1 union all select n + 1 from r) select * from r',
     'recursive CTEs',
@@ -221,6 +251,7 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
   assert.equal(remoteRequests, requestsAfterSetup, 'refused statements must not reach the network');
   assert.equal(existsSync(copyTarget), false, 'refused statements must not write files');
 
-  await runSQL('detach policy_db; drop schema policy cascade; drop view main.remote_name; drop table main.trap_name; select true as cleaned');
+  await runSQL(`detach policy_db; detach local_file_db; detach remote_file_db; drop schema policy cascade;
+    drop view main.remote_name; drop table main.trap_name; select true as cleaned`);
   await new Promise((resolve) => server.close(resolve));
 }

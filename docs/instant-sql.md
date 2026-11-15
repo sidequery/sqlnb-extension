@@ -36,8 +36,9 @@ remains available through explicit Run.
   visible to later CTEs of the same clause, to the query and to its subqueries,
   never inside its own body. When a CTE shares its name with a table or view, that
   relation must be acceptable too.
-- Tables in attached native DuckDB databases (including attached database files
-  and temporary tables), unqualified or qualified as `schema.table` or
+- Tables in attached native DuckDB databases that are in memory or stored at a
+  local path (including attached database files and temporary tables),
+  unqualified or qualified as `schema.table` or
   `database.schema.table`, without generated columns, whose column types are
   `BOOLEAN`, signed and unsigned integers, `FLOAT`, `DOUBLE`, `DECIMAL`, `DATE`,
   `TIME`, `TIMETZ`, `TIMESTAMP` (all precisions and `WITH TIME ZONE`), `INTERVAL`,
@@ -85,6 +86,13 @@ built-in name is refused.
 - Names that are not tables or views in an attached native DuckDB database: files,
   URLs and other replacement scans, and tables or views in attached databases of
   other types.
+- Tables and views in a native DuckDB database file attached from a remote
+  location (`http://`, `https://`, `s3://`, `hf://` and the other remote
+  prefixes DuckDB recognises, or any path with a non-`file:` scheme). Such a
+  database still reports the catalog type `duckdb`, but every read is network I/O
+  and a preview would repeat it whenever typing pauses. The check uses the
+  database's storage path (`Catalog::GetDBPath`), not its name, and applies inside
+  views too.
 - Any other table function, including file, network and catalog scans
   (`read_csv`, `read_parquet`, `glob`, `query`, `duckdb_*`), table macros and
   `PIVOT`/`UNPIVOT`, `DESCRIBE`, `SHOW` and `SUMMARIZE` in `FROM`.
