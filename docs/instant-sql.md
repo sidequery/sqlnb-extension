@@ -54,6 +54,13 @@ remains available through explicit Run.
 - Calls to an allowlist of side-effect-free scalar and aggregate built-ins
   (arithmetic, rounding, string, pattern-matching, list, struct and date/time
   helpers, and the common aggregates).
+- The operators that parse to built-in functions: arithmetic and unary minus,
+  `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` (with or without `ESCAPE`), `GLOB`,
+  `SIMILAR TO`, regular-expression `~` and `!~`, `^@` (starts with), the bitwise
+  `&`, `|`, `<<`, `>>`, `~` and `xor`, `^` (power), `||`, and the list operators
+  `@>`, `<@` and `&&`. DuckDB binds each of these by its function name (`LIKE` is
+  `~~`, `GLOB` is `~~~`), so a macro of that name on the search path would replace
+  the operator; such a macro is refused like any other.
 - Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`,
   `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`
   and the allowlisted aggregates, with partitions, ordering, frames, `FILTER`,

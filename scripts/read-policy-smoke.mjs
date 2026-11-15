@@ -115,6 +115,22 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
     ],
   );
 
+  // Pattern matching, bitwise and list operators bind built-in functions.
+  await accepts(
+    `select id, label like 'item%' as like_match, label not like '%2' as not_like, label ilike 'ITEM_' as ilike_match,
+            label not ilike 'x%' as not_ilike, label glob 'item[13]' as glob_match, label similar to 'item[0-9]' as similar,
+            label ~ '3$' as regex, label ^@ 'it' as prefix, label like 'item!%' escape '!' as escaped,
+            (id & 1) as bit_and, (id | 8) as bit_or, (id << 2) as shifted_left, (id >> 1) as shifted_right,
+            xor(id, 1) as bit_xor, ~id as bit_not, -id as negated, (2 ^ id)::integer as raised,
+            [1, 2, id] @> [id] as list_contains, [id] <@ [1, 2, 3] as list_contained, [id] && [2, 4] as list_overlap
+     from policy.items where label like 'item%' and id = 3`,
+    [{
+      id: 3, like_match: true, not_like: true, ilike_match: true, not_ilike: true, glob_match: true, similar: true,
+      regex: true, prefix: true, escaped: false, bit_and: 1, bit_or: 11, shifted_left: 12, shifted_right: 1,
+      bit_xor: 2, bit_not: -4, negated: -3, raised: 8, list_contains: true, list_contained: true, list_overlap: false,
+    }],
+  );
+
   // 2. Views, verified through their definitions with DuckDB's view search path.
   await accepts('select * from policy.items_view_view order by id10', [{ id10: 20 }, { id10: 30 }, { id10: 40 }]);
   await accepts('select top from policy.cte_view', [{ top: 4 }]);
@@ -165,6 +181,17 @@ export async function readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firs
   await runSQL('create schema shadow; create macro shadow.lower(x) as nextval(\'policy.counter\'); select true as ok');
   await runSQL('set search_path = \'shadow,main\'; select true as ok');
   await refuses('select lower(\'A\')', 'the macro \'lower\'');
+  await runSQL('reset search_path; drop schema shadow cascade; select true as ok');
+  // An operator is a function name: a macro on the search path replaces it.
+  await runSQL(`create schema shadow;
+    create macro shadow."~~"(a, b) as nextval('policy.counter') > 0;
+    create macro shadow."&"(a, b) as nextval('policy.counter');
+    create macro shadow."@>"(a, b) as nextval('policy.counter') > 0;
+    select true as ok`);
+  await runSQL('set search_path = \'shadow,main\'; select true as ok');
+  await refuses('select label from policy.items where label like \'item%\'', 'the macro \'~~\'');
+  await refuses('select 1 & 2', 'the macro \'&\'');
+  await refuses('select [1] @> [1]', 'the macro \'@>\'');
   await runSQL('reset search_path; drop schema shadow cascade; select true as ok');
   await refuses('select \'a\'::varchar(\'nocase\')', 'casts to the type');
   await refuses('select * from policy.sequence_view', 'the function \'nextval\'.*inside view');

@@ -157,6 +157,12 @@ private:
       "lower", "upper", "length", "char_length", "octet_length", "trim", "ltrim", "rtrim", "substring",
       "substr", "left", "right", "replace", "repeat", "concat", "concat_ws", "starts_with", "ends_with", "contains",
       "like_escape", "not_like_escape", "ilike_escape", "not_ilike_escape", "regexp_matches", "regexp_full_match",
+      // Operators parse to these function names and bind like any function, so
+      // a macro of the same name on the search path would replace them:
+      // LIKE ~~, NOT LIKE !~~, ILIKE ~~*, NOT ILIKE !~~*, GLOB ~~~, ^@ starts_with,
+      // bitwise & | << >> ~ xor, ^ power, and list containment @> <@ &&.
+      // SIMILAR TO and ~ (regex) parse to regexp_full_match and regexp_matches.
+      "~~", "!~~", "~~*", "!~~*", "~~~", "^@", "&", "|", "<<", ">>", "~", "xor", "^", "@>", "<@", "&&",
       "count", "count_star", "sum", "avg", "min", "max", "median", "stddev", "stddev_samp", "stddev_pop",
       "variance", "var_samp", "var_pop", "bool_and", "bool_or", "first", "last", "any_value", "string_agg",
       "list", "array_agg", "list_value", "struct_pack", "struct_extract", "array_extract", "list_extract",
