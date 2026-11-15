@@ -20,6 +20,7 @@ mod duckdb_ui;
 mod history;
 mod mcp;
 mod project_git;
+mod results;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
