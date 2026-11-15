@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   statSync,
@@ -102,10 +103,22 @@ writeFileSync(join(notebookRoot, 'nested', 'query.sql'), 'select 2;\n');
 writeFileSync(join(notebookRoot, 'ignored.txt'), 'not a notebook');
 symlinkSync(outsideRoot, join(notebookRoot, 'outside-link'));
 
+const childHome = mkdtempSync(join(tmpdir(), 'sidequery-ui-cli-home.'));
 const child = spawn(duckdb, [...cliOptions, ':memory:', '-json'], {
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: cliEnvironment(),
+  env: cliEnvironment(childHome),
 });
+// The result cache follows the platform cache directory of the CLI's HOME.
+const resultSessions = join(
+  process.platform === 'darwin'
+    ? join(childHome, 'Library', 'Caches')
+    : process.env.XDG_CACHE_HOME || join(childHome, '.cache'),
+  'sidequery', 'sqlnb-extension', 'results',
+);
+function resultFiles() {
+  if (!existsSync(resultSessions)) return [];
+  return readdirSync(resultSessions).flatMap((session) => readdirSync(join(resultSessions, session)));
+}
 let stdout = '';
 let stderr = '';
 const waiters = [];
@@ -629,6 +642,110 @@ for (const ownerFunction of ['sqlnb_status', 'sqlnb_stop']) {
   assert.equal(firstValue(await runSQL('select 42 as recovered')), 42);
 }
 
+// Result cache (docs/results.md), present with the final 2.0 Arrow scan API.
+const hasResultCache = firstValue(await runSQL(
+  "select count(*) from duckdb_functions() where function_name = 'sqlnb_result_tee'",
+)) > 0;
+if (hasResultCache) {
+  const resultId = (number) => number.toString(16).padStart(32, '0');
+  const large = resultId(1);
+  const small = resultId(2);
+  const source = "select i, i * 1.5 as amount, 'c-' || (i % 7) as label from range(50000) t(i)";
+  // Only the head passes through; every row is stored.
+  assert.deepEqual(
+    await runSQL(`select count(*) as n, min(i) as low, max(i) as high from sqlnb_result_tee((${source}), id := '${large}', meta := '{"cell":1}')`),
+    [{ n: 10240, low: 0, high: 10239 }],
+  );
+  assert.deepEqual(
+    await runSQL(`select count(*) as n from sqlnb_result_tee((select 1 as one), id := '${small}')`),
+    [{ n: 1 }],
+  );
+  assert.equal(
+    firstValue(await runSQL("select string_agg(column_name || ' ' || column_type, ', ') from (describe select * from sqlnb_results())")),
+    'id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN',
+  );
+  assert.deepEqual(
+    firstValue(await runSQL(`select list(r order by r.id) from (select id, rows, stored_rows, in_memory, limit_reason, meta, rows_exact from sqlnb_results() where id in ('${large}', '${small}')) r`)),
+    [
+      { id: large, rows: 50000, stored_rows: 50000, in_memory: false, limit_reason: null, meta: '{"cell":1}', rows_exact: true },
+      { id: small, rows: 1, stored_rows: 1, in_memory: true, limit_reason: null, meta: '', rows_exact: true },
+    ],
+  );
+  assert.deepEqual(resultFiles().filter((file) => file.endsWith('.arrow')), [`${large}.arrow`]);
+  // Reading back returns the input, in order, with its original column types.
+  assert.equal(
+    firstValue(await runSQL(`select count(*) from ((${source}) except all (select * from sqlnb_result('${large}')))`)),
+    0,
+  );
+  assert.equal(
+    firstValue(await runSQL(`select bool_and(i = position) and count(*) = 50000 from sqlnb_result('${large}', row_number := 'position')`)),
+    true,
+  );
+  assert.equal(
+    firstValue(await runSQL(`select list(column_type) = (select list(column_type) from (describe ${source})) from (describe select * from sqlnb_result('${large}'))`)),
+    true,
+  );
+  assert.deepEqual(
+    await runSQL(`select count(*) as n, min(i) as low, max(position) as high from sqlnb_result('${large}', first_row := 45000, row_count := 200, row_number := 'position')`),
+    [{ n: 200, low: 45000, high: 45199 }],
+  );
+  await expectSQLError(`select * from sqlnb_result('${resultId(99)}')`, /SQLNB_RESULT_MISSING:/);
+  await expectSQLError(`select * from sqlnb_result_tee((select 1), id := '${large}')`, /SQLNB_RESULT_EXISTS:/);
+  await expectSQLError(
+    `select * from sqlnb_result_tee((select 'a'::enum ('a', 'b') as mood), id := '${resultId(3)}')`,
+    /SQLNB_RESULT_UNSUPPORTED:/,
+  );
+  // A failing statement leaves nothing readable and frees its id.
+  await expectSQLError(
+    `select count(*) from sqlnb_result_tee((select case when i = 40000 then error('tee failed') else i end as i from range(50000) t(i)), id := '${resultId(3)}')`,
+    /tee failed/,
+  );
+  assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_results() where id = '${resultId(3)}'`)), 0);
+  assert.deepEqual(resultFiles().filter((file) => file.includes(resultId(3))), []);
+  assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_result_tee((select 1), id := '${resultId(3)}')`)), 1);
+  // A limit stops storing; stop_at_limit also stops reading. The notebook passes
+  // the Instant SQL verdict as a constant scalar call.
+  const endless = 'select i from range(100000000) t(i)';
+  await runSQL(`select count(*) from sqlnb_result_tee((${endless}), id := '${resultId(4)}', max_result_bytes := 100000, stop_at_limit := system.main.sqlnb_is_read_only(${sqlLiteral(endless)}))`);
+  await runSQL(`select count(*) from sqlnb_result_tee((${endless}), id := '${resultId(5)}', max_result_bytes := 100000, stop_at_limit := false)`);
+  const [stopped, counted] = firstValue(await runSQL(`select list(r order by r.id) from (select id, rows, stored_rows, limit_reason, rows_exact from sqlnb_results() where id in ('${resultId(4)}', '${resultId(5)}')) r`))
+    .map(({ id, ...result }) => result);
+  assert(stopped.rows < 1000000 && stopped.stored_rows > 0 && stopped.stored_rows <= stopped.rows, JSON.stringify(stopped));
+  assert.equal(stopped.limit_reason, 'result-bytes');
+  assert.equal(stopped.rows_exact, false);
+  assert.deepEqual(counted, { rows: 100000000, stored_rows: stopped.stored_rows, limit_reason: 'result-bytes', rows_exact: true });
+  assert.equal(
+    firstValue(await runSQL(`select count(*) = ${stopped.stored_rows} and max(i) = ${stopped.stored_rows - 1} from sqlnb_result('${resultId(4)}')`)),
+    true,
+  );
+  // The agent connection cannot reach the cache, on either SQL tool.
+  for (const sql of [
+    'select * from sqlnb_results()',
+    `select * from sqlnb_result('${small}')`,
+    `select sqlnb_result_drop('${small}')`,
+    `select * from sqlnb_result_tee((select 1), id := '${resultId(6)}')`,
+  ]) {
+    for (const execute of [false, true]) {
+      const rejected = await mcpSQL(sql, execute);
+      assert.equal(rejected.isError, true, `agent reached the result cache: ${sql}`);
+      assert.equal(rejected.structuredContent.error.code, 'POLICY_BLOCKED');
+    }
+  }
+  // Quack sessions (the notebook's path) share the process-wide cache.
+  const quackTee = spawnSync(duckdb, [...cliOptions, ':memory:', '-csv', '-noheader', '-c', [
+    loadExtensions(false),
+    `from quack_query(${sqlLiteral(`quack:${endpoint.hostname}:${endpoint.port}`)}, ${sqlLiteral(`select count(*) from sqlnb_result_tee((select * from range(30000) t(i)), id := '${resultId(7)}')`)}, token = ${sqlLiteral(token)})`,
+  ].join('; ')], { encoding: 'utf8', timeout: queryTimeoutMs, env: cliEnvironment() });
+  assert.equal(quackTee.status, 0, quackTee.stderr || quackTee.stdout);
+  assert.equal(quackTee.stdout.trim(), '10240');
+  assert.equal(firstValue(await runSQL(`select rows from sqlnb_results() where id = '${resultId(7)}'`)), 30000);
+  assert.equal(firstValue(await runSQL(`select sqlnb_result_drop('${large}')`)), true);
+  assert.equal(firstValue(await runSQL(`select sqlnb_result_drop('${large}')`)), false);
+  assert.deepEqual(resultFiles().filter((file) => file.includes(large)), []);
+  await expectSQLError(`select * from sqlnb_result('${large}')`, /SQLNB_RESULT_MISSING:/);
+  assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_results() where id = '${small}'`)), 1);
+}
+
 const serversBeforeStop = await runSQL('select count(*) as count from quack_server_list()');
 assert.equal(firstValue(serversBeforeStop), 1);
 assert.equal(firstValue(await runSQL('select sqlnb_stop()')), true);
@@ -772,6 +889,8 @@ await new Promise((resolve, reject) => {
       : reject(new Error(`DuckDB exited ${code}: ${stderr}`)),
   );
 });
+// Closing the database removes the process's result session.
+assert.deepEqual(existsSync(resultSessions) ? readdirSync(resultSessions) : [], []);
 console.log(
-  'native SQLNB bootstrap, named/default options, compatibility aliases, official Quack query, notebook history/restore, scoped Git commits/push, isolation, shutdown, security, and asset proxy smoke passed',
+  'native SQLNB bootstrap, named/default options, compatibility aliases, official Quack query, notebook history/restore, scoped Git commits/push, result cache, isolation, shutdown, security, and asset proxy smoke passed',
 );

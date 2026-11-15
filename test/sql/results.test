@@ -1,0 +1,145 @@
+# Result cache (docs/results.md). Results are process-wide, so every id here is
+# unique to this file.
+require sqlnb
+
+# Only the head passes through the tee; every row is stored.
+query III
+select count(*), min(i), max(i) from sqlnb_result_tee((select i, i * 1.5 as amount, 'c-' || (i % 7) as label from range(50000) t(i)), id := 'a0000000000000000000000000000001', meta := '{"cell":1}');
+----
+10240	0	10239
+
+query I
+select count(*) from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000002');
+----
+1
+
+# A result with more rows than its head is written to a file.
+query I
+select count(*) from sqlnb_result_tee((select * from range(5000) t(i)), id := 'a0000000000000000000000000000003', head_rows := 3000);
+----
+3000
+
+query TIIITTTI
+select id, rows, stored_rows, in_memory, limit_reason, meta, rows_exact, elapsed_ms >= 0 and created_ms > 0 from sqlnb_results() where id like 'a000000000000000000000000000000%' order by id;
+----
+a0000000000000000000000000000001	50000	50000	false	NULL	{"cell":1}	true	true
+a0000000000000000000000000000002	1	1	true	NULL	(empty)	true	true
+a0000000000000000000000000000003	5000	5000	false	NULL	(empty)	true	true
+
+query T
+select string_agg(column_name || ' ' || column_type, ', ') from (describe select * from sqlnb_results());
+----
+id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN
+
+# Reading back returns the input, in order, with its original column types.
+query I
+select count(*) from ((select i, i * 1.5 as amount, 'c-' || (i % 7) as label from range(50000) t(i)) except all (select * from sqlnb_result('a0000000000000000000000000000001')));
+----
+0
+
+query I
+select bool_and(i = position) and count(*) = 50000 from sqlnb_result('a0000000000000000000000000000001', row_number := 'position');
+----
+true
+
+query TT
+select column_name, column_type from (describe select * from sqlnb_result('a0000000000000000000000000000001'));
+----
+i	BIGINT
+amount	DECIMAL(21,1)
+label	VARCHAR
+
+query III
+select count(*), min(i), max(position) from sqlnb_result('a0000000000000000000000000000001', first_row := 45000, row_count := 200, row_number := 'position');
+----
+200	45000	45199
+
+query I
+select count(*) from sqlnb_result('a0000000000000000000000000000001', first_row := 60000);
+----
+0
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000001', row_number := 'label');
+----
+must be a new, non-empty column name
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000099');
+----
+SQLNB_RESULT_MISSING:
+
+statement error
+select * from sqlnb_result_tee((select 1), id := 'a0000000000000000000000000000001');
+----
+SQLNB_RESULT_EXISTS:
+
+statement error
+select * from sqlnb_result_tee((select 1), id := 'not-an-id');
+----
+must be 32 lowercase hexadecimal characters
+
+statement error
+select * from sqlnb_result_tee((select 'a'::enum ('a', 'b') as mood), id := 'a0000000000000000000000000000004');
+----
+SQLNB_RESULT_UNSUPPORTED:
+
+# A failing statement leaves nothing readable and frees its id.
+statement error
+select count(*) from sqlnb_result_tee((select case when i = 40000 then error('tee failed') else i end as i from range(50000) t(i)), id := 'a0000000000000000000000000000004');
+----
+tee failed
+
+query I
+select count(*) from sqlnb_results() where id = 'a0000000000000000000000000000004';
+----
+0
+
+query I
+select count(*) from sqlnb_result_tee((select 1), id := 'a0000000000000000000000000000004');
+----
+1
+
+# A limit stops storing but every row is still counted; stop_at_limit also
+# stops reading, so rows becomes a lower bound.
+statement ok
+select count(*) from sqlnb_result_tee((select i from range(100000000) t(i)), id := 'a0000000000000000000000000000005', max_result_bytes := 100000, stop_at_limit := true);
+
+statement ok
+select count(*) from sqlnb_result_tee((select i from range(10000000) t(i)), id := 'a0000000000000000000000000000006', max_result_bytes := 100000);
+
+query TIITI
+select id, rows < 1000000, stored_rows > 0 and stored_rows <= rows, limit_reason, rows_exact from sqlnb_results() where id in ('a0000000000000000000000000000005', 'a0000000000000000000000000000006') order by id;
+----
+a0000000000000000000000000000005	true	true	result-bytes	false
+a0000000000000000000000000000006	false	true	result-bytes	true
+
+query I
+select rows from sqlnb_results() where id = 'a0000000000000000000000000000006';
+----
+10000000
+
+query I
+select (select count(*) = max(i) + 1 from sqlnb_result('a0000000000000000000000000000005')) and (select count(*) from sqlnb_result('a0000000000000000000000000000005')) = (select stored_rows from sqlnb_results() where id = 'a0000000000000000000000000000005');
+----
+true
+
+query I
+select sqlnb_result_drop('a0000000000000000000000000000001');
+----
+true
+
+query I
+select sqlnb_result_drop('a0000000000000000000000000000001');
+----
+false
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000001');
+----
+SQLNB_RESULT_MISSING:
+
+query I
+select count(*) from sqlnb_results() where id = 'a0000000000000000000000000000002';
+----
+1
