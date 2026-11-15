@@ -322,7 +322,9 @@ public:
 // never waits for an earlier batch.
 //
 // Only the head needs the order while the statement runs, and the rows passed
-// on are exactly the first rows of the result. The thread reading the lowest
+// on are exactly the first rows of the result, whether or not the cache could
+// store them: a cache that stops storing never shortens what the statement
+// returns. The thread reading the lowest
 // executor batch passes its rows on at once. Every other thread holds the
 // first rows of its batch back; when the batch ends they wait in the global
 // state for the thread whose batch becomes the lowest, or for the last thread
@@ -457,9 +459,11 @@ private:
     return this->RequiredPartitionInfo().RequiresBatchIndex();
   }
 
-  // A statement the read policy verifies stops reading once nothing more is stored.
+  // A statement the read policy verifies stops reading once nothing more is
+  // stored. Not before its head is complete: threads that stopped earlier
+  // would leave the head with rows from wherever each of them had got to.
   bool StoppedAtLimit(TeeGlobalState &global) const {
-    return parameters->stop_at_limit && !global.storing;
+    return parameters->stop_at_limit && !global.storing && global.head_done;
   }
 
   void StartBatch(TeeLocalState &local) const {

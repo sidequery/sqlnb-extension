@@ -35,8 +35,15 @@ or a second tee, is an error before the statement runs.
 
 The statement returns only its first rows: whole chunks, as DuckDB produces
 them, until `head_rows` rows or `head_bytes` bytes have been returned (the chunk
-that crosses either is still returned whole). Every row is stored. The rows
-returned are exactly the first rows stored.
+that crosses either is still returned whole). Every row is stored, unless a
+limit or a failure stops storing (see [Limits](#limits)).
+
+The rows returned and the rows stored are both the first rows of the
+statement's result. When everything is stored, the rows returned are exactly
+the first rows stored. When storing stopped early, the result can keep fewer
+rows than the statement returned, down to none: `stored_rows` is then at most
+the number of rows returned, and the cache adds nothing to them. A cache that
+cannot store never shortens or reorders what the statement returns.
 
 The statement runs as it would without the tee, on all its threads, and each
 thread stores the rows it produces. They are stored in the statement's order:
@@ -98,7 +105,8 @@ not evicted to make room, and a volume that does not report its free space has
 no floor.
 
 With `stop_at_limit := true` the tee also stops reading its input once storing
-stops, as a `LIMIT` would, and publishes the stored prefix. `rows` is then the
+stops, as a `LIMIT` would, and publishes the stored prefix. It returns its first
+rows in full before it stops, also when storing stopped within them. `rows` is then the
 number of rows read, a lower bound, and `rows_exact` is false. The option accepts
 any constant expression, such as Instant SQL's verdict that a statement is safe
 to stop early:

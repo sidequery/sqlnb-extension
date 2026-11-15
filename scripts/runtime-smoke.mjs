@@ -818,7 +818,19 @@ if (hasResultCache) {
     await runSQL(`select count(*) > 0 as kept, bool_and(i = position) as ordered, count(*) = (select stored_rows from sqlnb_results() where id = '${resultId(14)}') as counted from sqlnb_result('${resultId(14)}', row_number := 'position')`),
     [{ kept: true, ordered: true, counted: true }],
   );
-  for (const number of [13, 14]) {
+  // A cache that stores nothing does not shorten or reorder the rows returned,
+  // also when the statement stops reading once storing has stopped.
+  for (const [number, stop] of [[15, false], [16, true]]) {
+    const unstored = await runRows(`select * from sqlnb_result_tee((select i, h from tee_scan), id := '${resultId(number)}', max_result_bytes := 0, stop_at_limit := ${stop})`);
+    assert(unstored.length >= 10240, `${unstored.length} head rows with nothing stored`);
+    assert(unstored.every((row, position) => Number(row.i) === position), `the head is not the first rows of the statement (stop_at_limit ${stop})`);
+    const [kept] = await runSQL(`select rows, rows_exact, stored_rows, limit_reason from sqlnb_results() where id = '${resultId(number)}'`);
+    assert.equal(kept.stored_rows, 0);
+    assert.equal(kept.limit_reason, 'result-bytes');
+    assert.equal(kept.rows_exact, !stop);
+    assert(stop ? kept.rows >= unstored.length && kept.rows < 3000000 : kept.rows === 3000000, JSON.stringify(kept));
+  }
+  for (const number of [13, 14, 15, 16]) {
     assert.equal(firstValue(await runSQL(`select sqlnb_result_drop('${resultId(number)}')`)), true);
   }
   await runStatement('drop table tee_scan');
