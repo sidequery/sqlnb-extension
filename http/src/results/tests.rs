@@ -15,11 +15,19 @@ struct Environment {
     /// Free bytes on the cache volume; `u64::MAX` for a volume that does not say.
     free_bytes: Arc<AtomicU64>,
     volume_bytes: Arc<AtomicU64>,
+    /// The next reading of the clock or of the free space panics.
+    panic_next: Arc<AtomicBool>,
 }
 
 impl Environment {
     fn advance(&self, milliseconds: i64) {
         self.now_ms.fetch_add(milliseconds, Ordering::Relaxed);
+    }
+
+    fn panic_if_asked(&self) {
+        if self.panic_next.swap(false, Ordering::Relaxed) {
+            panic!("the test asked the environment to panic");
+        }
     }
 }
 
@@ -30,12 +38,17 @@ fn open_store_in(directory: Result<PathBuf, String>) -> (Arc<ResultStore>, Envir
         now_ms: Arc::new(AtomicI64::new(1_700_000_000_000)),
         free_bytes: Arc::new(AtomicU64::new(512 * GIB)),
         volume_bytes: Arc::new(AtomicU64::new(1024 * GIB)),
+        panic_next: Arc::new(AtomicBool::new(false)),
     };
     let (clock, disk) = (environment.clone(), environment.clone());
     let store = Arc::new(ResultStore::with_environment(
         directory,
-        Box::new(move || clock.now_ms.load(Ordering::Relaxed)),
+        Box::new(move || {
+            clock.panic_if_asked();
+            clock.now_ms.load(Ordering::Relaxed)
+        }),
         Box::new(move |_| {
+            disk.panic_if_asked();
             let available = disk.free_bytes.load(Ordering::Relaxed);
             (available != u64::MAX)
                 .then(|| DiskSpace { available, total: disk.volume_bytes.load(Ordering::Relaxed) })
@@ -445,6 +458,25 @@ fn a_missing_batch_keeps_only_the_batches_before_it() {
     assert!(!writer.append(batch(12, 4), (3, 0)));
     writer.finish(16, true);
     assert_eq!(listed(&store), [(id(1), 16, 4, false, Some("io".into()), true)]);
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..4).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_batch_that_panics_while_being_stored_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    let writer = store.begin(&id(1), "", schema(), limits(8)).unwrap();
+    let append = |start: i64, key: BatchKey| {
+        let (array, _) = arrow_array::ffi::to_ffi(&StructArray::from(batch(start, 4)).into_data()).unwrap();
+        writer.append_ffi_guarded(array, key)
+    };
+    assert!(append(0, (0, 0)));
+    assert!(append(8, (0, 2)));
+    // The third batch moves the result to a file, which reads the free space.
+    environment.panic_next.store(true, Ordering::Relaxed);
+    assert!(!append(4, (0, 1)));
+    writer.finish(12, true);
+    assert_eq!(listed(&store), [(id(1), 12, 4, true, Some("io".into()), true)]);
     assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..4).collect::<Vec<_>>());
 }
 

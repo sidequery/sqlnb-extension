@@ -881,6 +881,17 @@ impl ResultWriter {
         }
     }
 
+    /// `append_ffi` for the exported function, which never unwinds. A panic
+    /// while storing the batch records it as missing: the caller takes `false`
+    /// to mean the cache already did.
+    fn append_ffi_guarded(&self, array: FFI_ArrowArray, key: BatchKey) -> bool {
+        let appended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.append_ffi(array, key)));
+        appended.unwrap_or_else(|_| {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.missing(key, LimitReason::Io)));
+            false
+        })
+    }
+
     /// Stores a batch whole, or not at all once a limit is reached. Returns
     /// whether later batches can still be stored.
     pub(crate) fn append(&self, batch: RecordBatch, key: BatchKey) -> bool {
@@ -1249,11 +1260,8 @@ pub unsafe extern "C" fn sidequery_result_append(
     major: u64,
     minor: u64,
 ) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let writer = unsafe { &*writer };
-        writer.append_ffi(unsafe { FFI_ArrowArray::from_raw(batch) }, (major, minor))
-    }))
-    .unwrap_or(false)
+    let writer = unsafe { &*writer };
+    writer.append_ffi_guarded(unsafe { FFI_ArrowArray::from_raw(batch) }, (major, minor))
 }
 
 #[no_mangle]
