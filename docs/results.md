@@ -24,7 +24,8 @@ select * from sqlnb_result_tee(
 | `head_bytes` | 4 MiB | Arrow buffer bytes returned to the caller. |
 | `meta` | `''` | Caller data returned by `sqlnb_results()`, at most 64 KiB. |
 | `max_result_bytes` | 4 GiB | Bytes stored for this result. |
-| `max_cache_bytes` | 16 GiB | Bytes stored for all results of the process. |
+| `max_cache_bytes` | 8 GiB | Bytes stored for all results of the process. |
+| `ttl_seconds` | 86400 | Seconds the result is kept after its last use. NULL keeps it until DuckDB exits. |
 | `stop_at_limit` | `false` | Stop reading the input once storing stops. |
 
 The tee marks the statement whose result is kept. That statement has to return
@@ -67,6 +68,12 @@ whose footer lets a read seek directly to the batches it needs.
 
 ### Limits
 
+`max_cache_bytes` is the caller's limit for the whole cache, not a property of
+one result: each tee applies the value it was given. When a tee begins, before
+it stores anything, the oldest results are evicted until the cache holds no
+more than that, so a caller that lowers its limit frees the space with its next
+statement, not before.
+
 When a result would exceed `max_result_bytes`, or the process's results would
 exceed `max_cache_bytes` even after evicting the oldest other results, the tee stops
 storing. The result keeps the rows before the first batch that was not stored, a
@@ -74,10 +81,21 @@ prefix of the statement's rows, and `limit_reason` says why. Batches are stored
 whole, and threads store later parts of the result while earlier parts are
 still being produced, so the prefix can be shorter than the limit by what the
 threads had in progress. The statement still runs to completion, and `rows`
-counts every row it produced. Failures to store, such as a full disk or an
-unwritable cache directory, likewise stop storing with `limit_reason = 'io'`; they
-never fail the statement. Limits count Arrow buffer bytes; a file can exceed its
-limit by its footer and the framing of its batches.
+counts every row it produced. Failures to store, such as an unwritable cache
+directory, likewise stop storing with `limit_reason = 'io'`; they never fail the
+statement. Limits count Arrow buffer bytes; a file can exceed its limit by its
+footer and the framing of its batches.
+
+The cache also leaves room on its disk. Nothing more is written to a result
+file once the volume that holds the cache would have less than 5 GiB free, or
+less than a tenth of its size on a volume smaller than 50 GiB. The result keeps
+what it has, with `limit_reason = 'disk-space'`, and results that fit in memory
+are still kept. The free space is read when a result's file is created and
+again after every 64 MiB written to the cache, so several threads can take the
+volume a little below the floor before storing stops; once it is below, the
+space is read before every write until there is room again. Other results are
+not evicted to make room, and a volume that does not report its free space has
+no floor.
 
 With `stop_at_limit := true` the tee also stops reading its input once storing
 stops, as a `LIMIT` would, and publishes the stored prefix. `rows` is then the
@@ -104,11 +122,13 @@ select * from sqlnb_result_tee(
 | `stored_rows` | BIGINT | Rows that can be read back. Less than `rows` after a limit. |
 | `stored_bytes` | BIGINT | File size, or Arrow buffer bytes for results in memory. |
 | `in_memory` | BOOLEAN | Whether the result is held in memory rather than a file. |
-| `limit_reason` | VARCHAR | `result-bytes`, `cache-bytes`, `io`, or NULL when every row was stored. |
+| `limit_reason` | VARCHAR | `result-bytes`, `cache-bytes`, `disk-space`, `io`, or NULL when every row was stored. |
 | `meta` | VARCHAR | The tee's `meta`. |
 | `created_ms` | BIGINT | Unix time in milliseconds when the statement started. |
 | `elapsed_ms` | BIGINT | Milliseconds from the start of the statement to the end of its input. |
 | `rows_exact` | BOOLEAN | False when `stop_at_limit` stopped the statement early. |
+| `last_used_ms` | BIGINT | Unix time in milliseconds when the statement finished or the result was last read. |
+| `expires_ms` | BIGINT | Unix time in milliseconds from which the result is no longer kept, unless it is read before. NULL when it is kept until DuckDB exits. |
 
 `sqlnb_result(id, first_row := 0, row_count := NULL, row_number := NULL)` reads a
 stored result back with its original column names, types and row order.
@@ -127,8 +147,29 @@ Columns with the same name come back with DuckDB's usual suffixes (`a`, `a_1`).
 `TIMESTAMP WITH TIME ZONE` values are stored in UTC.
 
 `sqlnb_result_drop(id)` removes a readable result and returns whether it existed.
-Scans that already started, including scans of evicted results, finish reading
-their rows.
+Scans that already started, including scans of evicted and expired results,
+finish reading their rows.
+
+## Expiry
+
+A result is kept for `ttl_seconds` after its last use and then expires. Its
+last use is the end of its statement or, later, the last time `sqlnb_result`
+read it: binding a read and starting its scan both count, so a result that is
+being paged through does not expire. Listing results with `sqlnb_results()` is
+not a use. The period belongs to the result: it is the `ttl_seconds` its tee
+was given, and later tees with another period do not change it.
+
+An expired result is gone exactly as an evicted one is: it is no longer listed,
+reading it raises `SQLNB_RESULT_MISSING:`, its file is removed and its id is
+free. A statement that runs longer than its period is not affected; the period
+starts when it finishes.
+
+There is no timer. Expired results are removed whenever the cache is used: when
+a tee is bound or begins, and by `sqlnb_results()`, `sqlnb_result` and
+`sqlnb_result_drop`. Until then an expired result's file stays on disk, so a
+DuckDB process that nobody queries keeps its last results until it exits.
+Times are the system clock's: setting the clock forward expires results early,
+setting it back keeps them longer.
 
 ## Errors
 
@@ -137,7 +178,7 @@ DuckDB prefixes these messages with the error type, such as `Invalid Input Error
 | Prefix | Raised by |
 |--------|-----------|
 | `SQLNB_RESULT_EXISTS:` | A tee whose id is already used by a running or readable result. |
-| `SQLNB_RESULT_MISSING:` | Reading a result that never existed, was dropped or was evicted. |
+| `SQLNB_RESULT_MISSING:` | Reading a result that never existed, was dropped, expired or was evicted. |
 | `SQLNB_RESULT_UNSUPPORTED:` | A tee over a column the cache cannot read back unchanged. |
 | `POLICY_BLOCKED:` | Any of these functions on the MCP agent connection. |
 
@@ -150,7 +191,8 @@ type. Cast those columns, for example to `VARCHAR`, before the tee.
 
 Results belong to the process: every connection and database in it shares them,
 including the notebook's Quack sessions. The MCP agent connection cannot use them.
-Results are removed when the last database that loaded SQLNB closes.
+Results are removed when the last database that loaded SQLNB closes, and
+earlier when they expire or are evicted.
 
 Files live in a directory of their own per process, created when the first result
 is written to disk, under:

@@ -31,8 +31,6 @@ namespace sqlnb_results {
 
 static constexpr int64_t DEFAULT_HEAD_ROWS = 10240;
 static constexpr int64_t DEFAULT_HEAD_BYTES = 4LL * 1024 * 1024;
-static constexpr int64_t DEFAULT_MAX_RESULT_BYTES = 4LL * 1024 * 1024 * 1024;
-static constexpr int64_t DEFAULT_MAX_CACHE_BYTES = 16LL * 1024 * 1024 * 1024;
 // A stored record batch holds this many rows, or fewer once its buffers reach
 // BATCH_BYTES, which bounds the memory one batch takes for very wide rows.
 static constexpr idx_t BATCH_ROWS = 8192;
@@ -115,6 +113,8 @@ struct TeeParameters {
   idx_t head_bytes;
   idx_t max_result_bytes;
   idx_t max_cache_bytes;
+  // Seconds the result is kept after its last use; 0 keeps it until DuckDB exits.
+  idx_t ttl_seconds;
   bool stop_at_limit;
   vector<LogicalType> types;
   vector<string> names;
@@ -349,7 +349,7 @@ public:
     char *error = nullptr;
     state->writer = sidequery_result_begin(parameters->id.c_str(), parameters->meta.c_str(), &schema.arrow_schema,
                                            parameters->head_rows, parameters->max_result_bytes,
-                                           parameters->max_cache_bytes, &error);
+                                           parameters->max_cache_bytes, parameters->ttl_seconds, &error);
     if (!state->writer) {
       ThrowCacheError(error);
     }
@@ -986,6 +986,14 @@ static unique_ptr<FunctionData> TeeBind(ClientContext &context, TableFunctionBin
   parameters->head_bytes = CountParameter(input, "head_bytes");
   parameters->max_result_bytes = CountParameter(input, "max_result_bytes");
   parameters->max_cache_bytes = CountParameter(input, "max_cache_bytes");
+  auto &ttl_seconds = input.named_parameters.at("ttl_seconds");
+  if (ttl_seconds.IsNull()) {
+    parameters->ttl_seconds = 0;
+  } else if (ttl_seconds.GetValue<int64_t>() <= 0) {
+    throw InvalidInputException("ttl_seconds must be positive, or NULL to keep the result until DuckDB exits");
+  } else {
+    parameters->ttl_seconds = NumericCast<idx_t>(ttl_seconds.GetValue<int64_t>());
+  }
   parameters->stop_at_limit = NamedParameter(input, "stop_at_limit").GetValue<bool>();
   parameters->types = input.input_table_types;
   parameters->names = IdentifiersToStrings(input.input_table_names);
@@ -1162,6 +1170,9 @@ static void DropResult(DataChunk &args, ExpressionState &state, Vector &result) 
 
 static void RegisterSQLNBResults(ExtensionLoader &loader) {
   using namespace sqlnb_results;
+  // The storage limits a caller does not name are the cache's own.
+  uint64_t max_result_bytes, max_cache_bytes, ttl_seconds;
+  sidequery_result_defaults(&max_result_bytes, &max_cache_bytes, &ttl_seconds);
   TableFunction tee("sqlnb_result_tee",
                     FunctionSignature()
                         .AddPositionalOnly("input", LogicalType::TABLE)
@@ -1170,9 +1181,11 @@ static void RegisterSQLNBResults(ExtensionLoader &loader) {
                         .AddKeywordOnly("head_bytes", LogicalType::BIGINT, Value::BIGINT(DEFAULT_HEAD_BYTES))
                         .AddKeywordOnly("meta", LogicalType::VARCHAR, Value(""))
                         .AddKeywordOnly("max_result_bytes", LogicalType::BIGINT,
-                                        Value::BIGINT(DEFAULT_MAX_RESULT_BYTES))
+                                        Value::BIGINT(NumericCast<int64_t>(max_result_bytes)))
                         .AddKeywordOnly("max_cache_bytes", LogicalType::BIGINT,
-                                        Value::BIGINT(DEFAULT_MAX_CACHE_BYTES))
+                                        Value::BIGINT(NumericCast<int64_t>(max_cache_bytes)))
+                        .AddKeywordOnly("ttl_seconds", LogicalType::BIGINT,
+                                        Value::BIGINT(NumericCast<int64_t>(ttl_seconds)))
                         .AddKeywordOnly("stop_at_limit", LogicalType::BOOLEAN, Value::BOOLEAN(false)),
                     nullptr, TeeBind, TeeInit);
   tee.in_out_function = TeeExecute;

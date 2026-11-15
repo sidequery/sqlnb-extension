@@ -15,6 +15,14 @@ pub(crate) struct FileIdentity {
     pub regular: bool,
 }
 
+/// Bytes on the volume that holds a path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiskSpace {
+    /// Free for this process to write.
+    pub available: u64,
+    pub total: u64,
+}
+
 pub(crate) fn home_directory() -> Option<std::ffi::OsString> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE");

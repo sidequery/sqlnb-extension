@@ -2,12 +2,51 @@ use super::*;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 
+use std::sync::atomic::AtomicI64;
+
 const UNLIMITED: u64 = u64::MAX;
+const GIB: u64 = 1024 * 1024 * 1024;
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
+/// The time and the disk a store sees, set by the test.
+#[derive(Clone)]
+struct Environment {
+    now_ms: Arc<AtomicI64>,
+    /// Free bytes on the cache volume; `u64::MAX` for a volume that does not say.
+    free_bytes: Arc<AtomicU64>,
+    volume_bytes: Arc<AtomicU64>,
+}
+
+impl Environment {
+    fn advance(&self, milliseconds: i64) {
+        self.now_ms.fetch_add(milliseconds, Ordering::Relaxed);
+    }
+}
+
+/// A store with a clock that stands still and a volume with room, so that
+/// neither the machine's clock nor its disk decides a test.
+fn open_store_in(directory: Result<PathBuf, String>) -> (Arc<ResultStore>, Environment) {
+    let environment = Environment {
+        now_ms: Arc::new(AtomicI64::new(1_700_000_000_000)),
+        free_bytes: Arc::new(AtomicU64::new(512 * GIB)),
+        volume_bytes: Arc::new(AtomicU64::new(1024 * GIB)),
+    };
+    let (clock, disk) = (environment.clone(), environment.clone());
+    let store = Arc::new(ResultStore::with_environment(
+        directory,
+        Box::new(move || clock.now_ms.load(Ordering::Relaxed)),
+        Box::new(move |_| {
+            let available = disk.free_bytes.load(Ordering::Relaxed);
+            (available != u64::MAX)
+                .then(|| DiskSpace { available, total: disk.volume_bytes.load(Ordering::Relaxed) })
+        }),
+    ));
+    store.retain();
+    (store, environment)
+}
 
 fn open_store(directory: &Path) -> Arc<ResultStore> {
-    let store = Arc::new(ResultStore::new(Ok(directory.to_path_buf())));
-    store.retain();
-    store
+    open_store_in(Ok(directory.to_path_buf())).0
 }
 
 fn schema() -> Schema {
@@ -35,7 +74,12 @@ fn limits(head_rows: u64) -> ResultLimits {
         head_rows,
         max_result_bytes: UNLIMITED,
         max_cache_bytes: UNLIMITED,
+        ttl_ms: None,
     }
+}
+
+fn kept_for(head_rows: u64, ttl_ms: i64) -> ResultLimits {
+    ResultLimits { ttl_ms: Some(ttl_ms as u64), ..limits(head_rows) }
 }
 
 fn id(number: u8) -> String {
@@ -100,6 +144,25 @@ fn listed(store: &ResultStore) -> Vec<(String, i64, i64, bool, Option<String>, b
             )
         })
         .collect()
+}
+
+fn listed_ids(store: &ResultStore) -> Vec<String> {
+    listed(store).into_iter().map(|result| result.0).collect()
+}
+
+/// When a listed result was last used and when it expires.
+fn usage(store: &ResultStore, id: &str) -> (i64, Option<i64>) {
+    let list = store.list();
+    let row = list.column(0).as_string::<i32>().iter().position(|listed| listed == Some(id)).unwrap();
+    let expires = list.column(11).as_primitive::<Int64Type>();
+    (
+        list.column(10).as_primitive::<Int64Type>().value(row),
+        expires.is_valid(row).then(|| expires.value(row)),
+    )
+}
+
+fn is_missing<T>(result: Result<T, String>) -> bool {
+    result.err().is_some_and(|error| error.starts_with("SQLNB_RESULT_MISSING:"))
 }
 
 fn session_files(directory: &Path) -> Vec<String> {
@@ -212,6 +275,7 @@ fn the_result_limit_keeps_a_prefix_and_counts_every_row() {
                 head_rows: 1000,
                 max_result_bytes: batch_size + batch_size / 2,
                 max_cache_bytes: UNLIMITED,
+                ttl_ms: None,
             },
         )
         .unwrap();
@@ -232,6 +296,7 @@ fn the_cache_limit_evicts_the_oldest_other_results() {
         head_rows: 1000,
         max_result_bytes: UNLIMITED,
         max_cache_bytes: batch_size * 2,
+        ttl_ms: None,
     };
     store_result(&store, &id(1), &[100], cache);
     store_result(&store, &id(2), &[100], cache);
@@ -268,8 +333,7 @@ fn stopping_early_reports_a_lower_bound() {
 
 #[test]
 fn an_unavailable_cache_directory_keeps_the_memory_prefix() {
-    let store = Arc::new(ResultStore::new(Err("no cache root".into())));
-    store.retain();
+    let store = open_store_in(Err("no cache root".into())).0;
     let writer = store.begin(&id(1), "", schema(), limits(4)).unwrap();
     assert!(writer.append(batch(0, 4), (0, 0)));
     assert!(!writer.append(batch(4, 4), (0, 1)));
@@ -406,4 +470,241 @@ fn threads_store_batches_at_the_same_time() {
     let total = THREADS * BATCHES * ROWS;
     writer.finish(total as u64, true);
     assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..total).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_lower_cache_limit_evicts_the_oldest_results_when_the_next_result_begins() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_store(directory.path());
+    for result in 1..=3 {
+        store_result(&store, &id(result), &[100], limits(0));
+    }
+    let result_bytes = store.lock().entries[&id(3)].stored_bytes;
+    let lowered = ResultLimits { max_cache_bytes: result_bytes * 2, ..limits(0) };
+    let writer = store.begin(&id(4), "", schema(), lowered).unwrap();
+    // Before the new result stored anything.
+    assert_eq!(listed_ids(&store), [id(3), id(2)]);
+    assert_eq!(
+        session_files(directory.path()),
+        [format!("{}.arrow", id(2)), format!("{}.arrow", id(3)), SESSION_LOCK.to_string()]
+    );
+    drop(writer);
+}
+
+#[test]
+fn a_caller_that_names_no_limits_keeps_4_gib_of_a_result_8_gib_in_all_for_24_hours() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_store(directory.path());
+    let defaults = ResultLimits::defaults(1000);
+    let batch_size = batch_bytes(&batch(0, 100));
+    let set_stored_bytes = |result: &str, bytes: u64| {
+        store.lock().entries.get_mut(result).unwrap().stored_bytes = bytes;
+    };
+
+    store_result(&store, &id(1), &[100], defaults);
+    let (last_used, expires) = usage(&store, &id(1));
+    assert_eq!(expires, Some(last_used + 24 * HOUR_MS));
+
+    // The cache holds one batch less than 8 GiB: one more batch fits, a second does not.
+    set_stored_bytes(&id(1), 8 * GIB - batch_size);
+    store_result(&store, &id(2), &[100], defaults);
+    assert_eq!(listed_ids(&store), [id(2), id(1)]);
+    store_result(&store, &id(3), &[100], defaults);
+    assert_eq!(listed_ids(&store), [id(3), id(2)]);
+
+    // A result that holds one batch less than 4 GiB takes one more batch.
+    let writer = store.begin(&id(4), "", schema(), defaults).unwrap();
+    set_stored_bytes(&id(4), 4 * GIB - batch_size);
+    assert!(writer.append(batch(0, 100), (0, 0)));
+    assert!(!writer.append(batch(100, 100), (0, 1)));
+    writer.finish(200, true);
+    assert_eq!(listed(&store)[0], (id(4), 200, 100, true, Some("result-bytes".into()), true));
+}
+
+#[test]
+fn a_result_expires_after_its_period_without_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    store_result(&store, &id(1), &[3, 3], kept_for(0, HOUR_MS));
+    store_result(&store, &id(2), &[3], kept_for(10, HOUR_MS));
+    store_result(&store, &id(3), &[3], limits(10));
+    let (last_used, expires) = usage(&store, &id(1));
+    assert_eq!(expires, Some(last_used + HOUR_MS));
+    assert_eq!(usage(&store, &id(3)).1, None);
+
+    environment.advance(HOUR_MS - 1);
+    assert_eq!(listed_ids(&store), [id(3), id(2), id(1)]);
+
+    environment.advance(1);
+    assert_eq!(listed_ids(&store), [id(3)]);
+    assert_eq!(session_files(directory.path()), [SESSION_LOCK]);
+    assert!(is_missing(store.scan_schema(&id(1), None)));
+    assert!(is_missing(store.scan(&id(2), 0, UNLIMITED, None, &[0]).map(|_| ())));
+    assert!(!store.drop_result(&id(1)));
+    // The id is free again, as after an eviction.
+    store_result(&store, &id(1), &[1], limits(10));
+
+    // A result without a period stays until the cache closes.
+    environment.advance(10 * 365 * 24 * HOUR_MS);
+    assert_eq!(listed_ids(&store), [id(1), id(3)]);
+}
+
+#[test]
+fn reading_a_result_starts_its_period_again_and_listing_does_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    store_result(&store, &id(1), &[3, 3], kept_for(0, HOUR_MS));
+    store_result(&store, &id(2), &[3, 3], kept_for(0, HOUR_MS));
+    store_result(&store, &id(3), &[3, 3], kept_for(0, HOUR_MS));
+    let stored_at = usage(&store, &id(1)).0;
+
+    environment.advance(HOUR_MS - 1);
+    assert_eq!(scan_values(&store, &id(1), 2, 2, None, &[0])[0], [2, 3]);
+    store.scan_schema(&id(2), None).unwrap();
+    assert_eq!(usage(&store, &id(1)), (stored_at + HOUR_MS - 1, Some(stored_at + 2 * HOUR_MS - 1)));
+    assert_eq!(usage(&store, &id(3)), (stored_at, Some(stored_at + HOUR_MS)));
+
+    // Only the two that were read are still there.
+    environment.advance(1);
+    assert_eq!(listed_ids(&store), [id(2), id(1)]);
+    environment.advance(HOUR_MS - 2);
+    assert_eq!(listed_ids(&store), [id(2), id(1)]);
+    environment.advance(1);
+    assert!(listed_ids(&store).is_empty());
+    assert_eq!(session_files(directory.path()), [SESSION_LOCK]);
+}
+
+#[test]
+fn the_period_starts_when_the_statement_ends() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    let writer = store.begin(&id(1), "", schema(), kept_for(0, HOUR_MS)).unwrap();
+    assert!(writer.append(batch(0, 5), (0, 0)));
+    environment.advance(3 * HOUR_MS);
+    // A statement that runs longer than the period is not swept while it runs.
+    assert!(listed(&store).is_empty());
+    assert!(writer.append(batch(5, 5), (0, 1)));
+    writer.finish(10, true);
+    let finished_at = environment.now_ms.load(Ordering::Relaxed);
+    assert_eq!(usage(&store, &id(1)), (finished_at, Some(finished_at + HOUR_MS)));
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn every_use_of_the_cache_removes_the_results_that_expired() {
+    type Touch = fn(&Arc<ResultStore>);
+    let touches: [(&str, Touch); 6] = [
+        ("check", |store| store.check(&id(9), "", &schema()).unwrap()),
+        ("begin", |store| drop(store.begin(&id(9), "", schema(), limits(0)).unwrap())),
+        ("list", |store| drop(store.list())),
+        ("schema", |store| drop(store.scan_schema(&id(2), None).unwrap())),
+        ("scan", |store| drop(store.scan(&id(2), 0, UNLIMITED, None, &[0]).unwrap())),
+        ("drop", |store| assert!(store.drop_result(&id(2)))),
+    ];
+    for (name, touch) in touches {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+        store_result(&store, &id(1), &[3], kept_for(0, HOUR_MS));
+        store_result(&store, &id(2), &[3], limits(0));
+        environment.advance(HOUR_MS);
+        assert!(session_files(directory.path()).contains(&format!("{}.arrow", id(1))), "{name}");
+        touch(&store);
+        assert!(!session_files(directory.path()).contains(&format!("{}.arrow", id(1))), "{name}");
+        assert!(!store.lock().entries.contains_key(&id(1)), "{name}");
+    }
+}
+
+#[test]
+fn a_scan_that_is_open_when_its_result_expires_reads_to_the_end() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    store_result(&store, &id(1), &[3, 3], kept_for(0, HOUR_MS));
+    let scan = store.scan(&id(1), 0, UNLIMITED, None, &[0]).unwrap();
+    environment.advance(HOUR_MS);
+    assert!(listed(&store).is_empty());
+    assert_eq!(scan.map(|batch| batch.unwrap().num_rows()).sum::<usize>(), 6);
+    assert!(is_missing(store.scan(&id(1), 0, UNLIMITED, None, &[0]).map(|_| ())));
+}
+
+#[test]
+fn nothing_is_written_to_a_volume_below_its_free_space_floor() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    let two_batches = batch_bytes(&batch(0, 100)) + batch_bytes(&batch(100, 100));
+
+    // One byte short of 5 GiB left once the file held its first two batches.
+    environment.free_bytes.store(5 * GIB + two_batches - 1, Ordering::Relaxed);
+    let writer = store.begin(&id(1), "", schema(), limits(100)).unwrap();
+    assert!(writer.append(batch(0, 100), (0, 0)));
+    assert!(!writer.append(batch(100, 100), (0, 1)));
+    writer.finish(200, true);
+    // The statement goes on; the rows before the floor stay, in memory.
+    assert_eq!(listed(&store), [(id(1), 200, 100, true, Some("disk-space".into()), true)]);
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..100).collect::<Vec<_>>());
+    assert_eq!(session_files(directory.path()), [SESSION_LOCK]);
+
+    // A result that fits in memory needs no disk.
+    environment.free_bytes.store(0, Ordering::Relaxed);
+    store_result(&store, &id(2), &[100], limits(100));
+    assert_eq!(listed(&store)[0], (id(2), 100, 100, true, None, true));
+
+    // With room again, results are written again.
+    environment.free_bytes.store(5 * GIB + two_batches, Ordering::Relaxed);
+    store_result(&store, &id(3), &[100, 100], limits(100));
+    assert_eq!(listed(&store)[0], (id(3), 200, 200, false, None, true));
+}
+
+#[test]
+fn a_result_being_written_stops_when_the_volume_runs_low() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    let writer = store.begin(&id(1), "", schema(), limits(0)).unwrap();
+    assert!(writer.append(batch(0, 100), (0, 0)));
+    environment.free_bytes.store(GIB, Ordering::Relaxed);
+    // The free space is not read for every batch, only every 64 MiB written.
+    assert!(writer.append(batch(100, 100), (0, 1)));
+    store.unprobed_bytes.store(DISK_PROBE_BYTES, Ordering::Relaxed);
+    assert!(!writer.append(batch(200, 100), (0, 2)));
+
+    // Once low, the space is read before every write, also for other results.
+    let other = store.begin(&id(2), "", schema(), limits(0)).unwrap();
+    assert!(!other.append(batch(0, 100), (0, 0)));
+    other.finish(100, true);
+    writer.finish(300, true);
+    assert_eq!(
+        listed(&store),
+        [
+            (id(2), 100, 0, true, Some("disk-space".into()), true),
+            (id(1), 300, 200, false, Some("disk-space".into()), true),
+        ]
+    );
+    assert_eq!(scan_values(&store, &id(1), 0, UNLIMITED, None, &[0])[0], (0..200).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_floor_of_a_small_volume_is_a_tenth_of_it_and_an_unknown_volume_has_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, environment) = open_store_in(Ok(directory.path().to_path_buf()));
+    environment.volume_bytes.store(20 * GIB, Ordering::Relaxed);
+    environment.free_bytes.store(3 * GIB, Ordering::Relaxed);
+    store_result(&store, &id(1), &[100], limits(0));
+    environment.free_bytes.store(2 * GIB, Ordering::Relaxed);
+    store_result(&store, &id(2), &[100], limits(0));
+    environment.free_bytes.store(u64::MAX, Ordering::Relaxed);
+    store_result(&store, &id(3), &[100], limits(0));
+    assert_eq!(
+        listed(&store),
+        [
+            (id(3), 100, 100, false, None, true),
+            (id(2), 100, 0, true, Some("disk-space".into()), true),
+            (id(1), 100, 100, false, None, true),
+        ]
+    );
+}
+
+#[test]
+fn the_volume_of_a_directory_reports_its_space() {
+    let directory = tempfile::tempdir().unwrap();
+    let space = disk_space(directory.path()).expect("the temporary directory is on a volume");
+    assert!(space.available > 0 && space.available <= space.total, "{space:?}");
 }

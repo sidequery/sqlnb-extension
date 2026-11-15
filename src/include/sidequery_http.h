@@ -36,11 +36,19 @@ void sidequery_results_release(void);
 // Validates a new result's id, meta and schema before its statement runs.
 bool sidequery_result_check(const char *id, const char *meta, struct ArrowSchema *schema,
                             char **error_out);
+// The limits of a caller that names none: bytes kept for one result, bytes
+// kept for all results, and seconds a result is kept after its last use.
+void sidequery_result_defaults(uint64_t *max_result_bytes, uint64_t *max_cache_bytes,
+                               uint64_t *ttl_seconds);
 // Registers an unreadable result; finish makes it readable, abort discards it.
+// Results older than max_cache_bytes allows are evicted here. The result
+// expires ttl_seconds after it was finished or last read; 0 keeps it until
+// the cache is released.
 sidequery_result_writer *sidequery_result_begin(const char *id, const char *meta,
                                                 struct ArrowSchema *schema, uint64_t head_rows,
                                                 uint64_t max_result_bytes,
-                                                uint64_t max_cache_bytes, char **error_out);
+                                                uint64_t max_cache_bytes, uint64_t ttl_seconds,
+                                                char **error_out);
 // Stores the rows of a struct array whose fields match the schema, from any
 // thread. The result reads back in the order of the keys (major, then minor),
 // whatever order the batches were stored in. Returns false when the batch was
@@ -54,7 +62,8 @@ void sidequery_result_missing(sidequery_result_writer *writer, uint64_t major, u
 // statement stopped reading early and rows is only a lower bound.
 void sidequery_result_finish(sidequery_result_writer *writer, uint64_t rows, bool rows_exact);
 void sidequery_result_abort(sidequery_result_writer *writer);
-// Exports one row per readable result, newest first.
+// Exports one row per readable result, newest first. Listing, reading,
+// dropping and beginning a result first remove the results that expired.
 bool sidequery_results_list(struct ArrowArrayStream *out, char **error_out);
 // Exports the columns of a stored result, then a BIGINT column named row_number
 // unless row_number is null.

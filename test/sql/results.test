@@ -46,7 +46,7 @@ a0000000000000000000000000000003	5000	5000	false	NULL	(empty)	true	true
 query T
 select string_agg(column_name || ' ' || column_type, ', ') from (describe select * from sqlnb_results());
 ----
-id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN
+id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN, last_used_ms BIGINT, expires_ms BIGINT
 
 # Reading back returns the input, in order, with its original column types.
 query I
@@ -190,3 +190,36 @@ query I
 select count(*) from sqlnb_results() where id = 'a0000000000000000000000000000002';
 ----
 1
+
+# A result is kept for 24 hours after its last use unless the tee names another
+# period; NULL keeps it until DuckDB exits.
+query I
+select expires_ms - last_used_ms from sqlnb_results() where id = 'a0000000000000000000000000000002';
+----
+86400000
+
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000020', ttl_seconds := 3600);
+
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000021', ttl_seconds := NULL);
+
+query II
+select id, expires_ms - last_used_ms from sqlnb_results() where id in ('a0000000000000000000000000000020', 'a0000000000000000000000000000021') order by id;
+----
+a0000000000000000000000000000020	3600000
+a0000000000000000000000000000021	NULL
+
+statement error
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000022', ttl_seconds := 0);
+----
+ttl_seconds must be positive
+
+# A cache limit below what is kept evicts the oldest results when the next result begins.
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000023', max_cache_bytes := 0);
+
+query IIIT
+select id, rows, stored_rows, limit_reason from sqlnb_results();
+----
+a0000000000000000000000000000023	1	0	cache-bytes

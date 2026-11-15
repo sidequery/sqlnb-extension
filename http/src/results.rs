@@ -3,7 +3,9 @@
 //! The registry is process-global. Results small enough stay in memory; the
 //! others are Arrow IPC files in one session directory per process, which a
 //! lock file claims for the life of the process.
-use crate::platform::{open_lease_file, open_lock_file, private_new_file, try_lock_file, LOCK_EX};
+use crate::platform::{
+    disk_space, open_lease_file, open_lock_file, private_new_file, try_lock_file, DiskSpace, LOCK_EX,
+};
 use arrow_array::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::{
@@ -36,11 +38,22 @@ const SESSION_LOCK: &str = "session.lock";
 const SESSION_CLAIM_GRACE: Duration = Duration::from_secs(60);
 /// Messages and their bodies start on this boundary in a result file.
 const FILE_ALIGNMENT: u8 = 8;
+/// What `sqlnb_result_tee` uses for a caller that names no limit.
+const DEFAULT_MAX_RESULT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// Nothing more is written to a result file while its volume has less free
+/// space than this, or than a tenth of a volume too small for that.
+const MIN_FREE_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MIN_FREE_DISK_DIVISOR: u64 = 10;
+/// The free space is read again after this many bytes were written.
+const DISK_PROBE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LimitReason {
     ResultBytes,
     CacheBytes,
+    DiskSpace,
     Io,
 }
 
@@ -49,6 +62,7 @@ impl LimitReason {
         match self {
             LimitReason::ResultBytes => "result-bytes",
             LimitReason::CacheBytes => "cache-bytes",
+            LimitReason::DiskSpace => "disk-space",
             LimitReason::Io => "io",
         }
     }
@@ -59,12 +73,35 @@ pub(crate) struct ResultLimits {
     pub head_rows: u64,
     pub max_result_bytes: u64,
     pub max_cache_bytes: u64,
+    /// How long the result is kept after its last use; `None` keeps it until
+    /// the process ends.
+    pub ttl_ms: Option<u64>,
+}
+
+impl ResultLimits {
+    /// The limits of a caller that names none.
+    pub(crate) fn defaults(head_rows: u64) -> Self {
+        Self {
+            head_rows,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
+            ttl_ms: Some(DEFAULT_TTL_SECONDS * 1000),
+        }
+    }
 }
 
 pub(crate) struct ResultStore {
     /// Parent of the session directories; unavailable without a cache root.
     directory: Result<PathBuf, String>,
     state: Mutex<StoreState>,
+    /// Milliseconds since the Unix epoch.
+    clock: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// The space on the volume of a directory; `None` when it cannot be read.
+    disk_space: Box<dyn Fn(&Path) -> Option<DiskSpace> + Send + Sync>,
+    /// Bytes written to result files since the free space was last read.
+    unprobed_bytes: AtomicU64,
+    /// The last reading was below the floor: read again before every write.
+    disk_low: AtomicBool,
 }
 
 #[derive(Default)]
@@ -85,6 +122,9 @@ struct Session {
 struct Entry {
     sequence: u64,
     created_ms: i64,
+    /// When the statement finished, or when the result was last read.
+    last_used_ms: i64,
+    ttl_ms: Option<u64>,
     meta: String,
     schema: SchemaRef,
     stored_bytes: u64,
@@ -115,18 +155,110 @@ impl Entry {
             let _ = fs::remove_file(path);
         }
     }
+
+    /// When a readable result stops being kept unless it is read before.
+    fn expires_ms(&self) -> Option<i64> {
+        let ttl_ms = i64::try_from(self.ttl_ms?).unwrap_or(i64::MAX);
+        Some(self.last_used_ms.saturating_add(ttl_ms))
+    }
+}
+
+impl StoreState {
+    /// Takes out the readable results nobody used for their whole period. A
+    /// result still being stored has not begun its period.
+    fn take_expired(&mut self, now_ms: i64) -> Vec<Entry> {
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.stored.is_some() && entry.expires_ms().is_some_and(|expires| expires <= now_ms)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired.iter().filter_map(|id| self.entries.remove(id)).collect()
+    }
+
+    /// Takes out the oldest readable results other than `keep` until the cache
+    /// holds at most `limit` bytes or has no other to give up. Returns the
+    /// bytes it still holds with what it took out.
+    fn evict_oldest(&mut self, keep: &str, limit: u64) -> (u64, Vec<Entry>) {
+        let mut used: u64 = self.entries.values().map(|entry| entry.stored_bytes).sum();
+        let mut evicted = Vec::new();
+        while used > limit {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(other, entry)| other.as_str() != keep && entry.stored.is_some())
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(other, _)| other.clone());
+            let Some(oldest) = oldest else { break };
+            let entry = self.entries.remove(&oldest).expect("oldest entry exists");
+            used -= entry.stored_bytes;
+            evicted.push(entry);
+        }
+        (used, evicted)
+    }
 }
 
 impl ResultStore {
     pub(crate) fn new(directory: Result<PathBuf, String>) -> Self {
+        Self::with_environment(directory, Box::new(unix_ms), Box::new(disk_space))
+    }
+
+    fn with_environment(
+        directory: Result<PathBuf, String>,
+        clock: Box<dyn Fn() -> i64 + Send + Sync>,
+        disk_space: Box<dyn Fn(&Path) -> Option<DiskSpace> + Send + Sync>,
+    ) -> Self {
         Self {
             directory,
             state: Mutex::new(StoreState::default()),
+            clock,
+            disk_space,
+            unprobed_bytes: AtomicU64::new(0),
+            disk_low: AtomicBool::new(false),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, StoreState> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Locks the registry once the results that expired are gone from it.
+    /// Every call that lists, reads, drops or begins a result comes through
+    /// here, which is what removes expired results: there is no timer.
+    fn lock_swept(&self) -> MutexGuard<'_, StoreState> {
+        let mut state = self.lock();
+        let expired = state.take_expired((self.clock)());
+        if expired.is_empty() {
+            return state;
+        }
+        drop(state);
+        for entry in &expired {
+            entry.remove_file();
+        }
+        self.lock()
+    }
+
+    /// Whether `bytes` more may be written to a result file in `directory`.
+    /// `first` is set for the write that creates the file.
+    fn disk_room(&self, directory: &Path, bytes: u64, first: bool) -> Result<(), LimitReason> {
+        let unprobed = self.unprobed_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+        if !first && unprobed < DISK_PROBE_BYTES && !self.disk_low.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.unprobed_bytes.store(0, Ordering::Relaxed);
+        // A volume that does not report its space is not held against the result.
+        let low = (self.disk_space)(directory).is_some_and(|space| {
+            let floor = MIN_FREE_DISK_BYTES.min(space.total / MIN_FREE_DISK_DIVISOR);
+            space.available < floor.saturating_add(bytes)
+        });
+        self.disk_low.store(low, Ordering::Relaxed);
+        if low {
+            Err(LimitReason::DiskSpace)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn retain(&self) {
@@ -156,7 +288,7 @@ impl ResultStore {
     /// Validates a result before its statement runs.
     pub(crate) fn check(&self, id: &str, meta: &str, schema: &Schema) -> Result<(), String> {
         validate_new_result(id, meta, schema)?;
-        if self.lock().entries.contains_key(id) {
+        if self.lock_swept().entries.contains_key(id) {
             return Err(exists(id));
         }
         Ok(())
@@ -171,21 +303,29 @@ impl ResultStore {
     ) -> Result<ResultWriter, String> {
         validate_new_result(id, meta, &schema)?;
         let schema = Arc::new(schema);
-        {
-            let mut state = self.lock();
+        let evicted = {
+            let mut state = self.lock_swept();
             if state.entries.contains_key(id) {
                 return Err(exists(id));
             }
             state.next_sequence += 1;
+            let now_ms = (self.clock)();
             let entry = Entry {
                 sequence: state.next_sequence,
-                created_ms: unix_ms(),
+                created_ms: now_ms,
+                last_used_ms: now_ms,
+                ttl_ms: limits.ttl_ms,
                 meta: meta.to_string(),
                 schema: schema.clone(),
                 stored_bytes: 0,
                 stored: None,
             };
             state.entries.insert(id.to_string(), entry);
+            // A cache limit lower than what is kept applies from here on.
+            state.evict_oldest(id, limits.max_cache_bytes).1
+        };
+        for entry in evicted {
+            entry.remove_file();
         }
         Ok(ResultWriter {
             store: self.clone(),
@@ -203,34 +343,22 @@ impl ResultStore {
     /// Counts `requested` more stored bytes for the result `id`, evicting the
     /// oldest other readable results when the whole cache would exceed its limit.
     fn reserve(&self, id: &str, requested: u64, limits: &ResultLimits) -> Result<(), LimitReason> {
-        let mut evicted = Vec::new();
-        let reserved = {
+        let (reserved, evicted) = {
             let mut state = self.lock();
             // Without its entry, the cache closed while this statement ran.
             let stored_bytes = state.entries.get(id).ok_or(LimitReason::Io)?.stored_bytes;
             if stored_bytes.saturating_add(requested) > limits.max_result_bytes {
-                Err(LimitReason::ResultBytes)
+                (Err(LimitReason::ResultBytes), Vec::new())
             } else {
-                let mut used: u64 = state.entries.values().map(|entry| entry.stored_bytes).sum();
-                while used.saturating_add(requested) > limits.max_cache_bytes {
-                    let oldest = state
-                        .entries
-                        .iter()
-                        .filter(|(other, entry)| other.as_str() != id && entry.stored.is_some())
-                        .min_by_key(|(_, entry)| entry.sequence)
-                        .map(|(other, _)| other.clone());
-                    let Some(oldest) = oldest else { break };
-                    let entry = state.entries.remove(&oldest).expect("oldest entry exists");
-                    used -= entry.stored_bytes;
-                    evicted.push(entry);
-                }
+                let (used, evicted) =
+                    state.evict_oldest(id, limits.max_cache_bytes.saturating_sub(requested));
                 if used.saturating_add(requested) > limits.max_cache_bytes {
-                    Err(LimitReason::CacheBytes)
+                    (Err(LimitReason::CacheBytes), evicted)
                 } else {
                     if let Some(entry) = state.entries.get_mut(id) {
                         entry.stored_bytes += requested;
                     }
-                    Ok(())
+                    (Ok(()), evicted)
                 }
             }
         };
@@ -241,11 +369,14 @@ impl ResultStore {
     }
 
     fn complete(&self, id: &str, stored: StoredResult, stored_bytes: u64) {
+        let now_ms = (self.clock)();
         let mut state = self.lock();
         match state.entries.get_mut(id) {
             Some(entry) => {
                 entry.stored_bytes = stored_bytes;
                 entry.stored = Some(Arc::new(stored));
+                // The period without use starts when the result can be read.
+                entry.last_used_ms = now_ms;
             }
             None => {
                 if let StoredData::File(path) = stored.data {
@@ -289,7 +420,7 @@ impl ResultStore {
 
     pub(crate) fn drop_result(&self, id: &str) -> bool {
         let removed = {
-            let mut state = self.lock();
+            let mut state = self.lock_swept();
             match state.entries.get(id) {
                 Some(entry) if entry.stored.is_some() => state.entries.remove(id),
                 _ => None,
@@ -298,13 +429,14 @@ impl ResultStore {
         removed.map(|entry| entry.remove_file()).is_some()
     }
 
+    /// A result about to be read, which counts as a use of it.
     fn readable(&self, id: &str) -> Result<(SchemaRef, Arc<StoredResult>), String> {
-        let state = self.lock();
-        state
-            .entries
-            .get(id)
-            .and_then(|entry| Some((entry.schema.clone(), entry.stored.clone()?)))
-            .ok_or_else(|| missing(id))
+        let now_ms = (self.clock)();
+        let mut state = self.lock_swept();
+        let entry = state.entries.get_mut(id).ok_or_else(|| missing(id))?;
+        let stored = entry.stored.clone().ok_or_else(|| missing(id))?;
+        entry.last_used_ms = now_ms;
+        Ok((entry.schema.clone(), stored))
     }
 
     /// The columns `scan` reads: the stored columns, then the optional row number.
@@ -326,13 +458,15 @@ impl ResultStore {
         // Open the file before a concurrent drop can remove it; an open scan
         // keeps reading the file it opened.
         let (schema, stored, file) = {
-            let state = self.lock();
-            let entry = state.entries.get(id).ok_or_else(|| missing(id))?;
+            let now_ms = (self.clock)();
+            let mut state = self.lock_swept();
+            let entry = state.entries.get_mut(id).ok_or_else(|| missing(id))?;
             let stored = entry.stored.clone().ok_or_else(|| missing(id))?;
             let file = match &stored.data {
                 StoredData::File(path) => Some(File::open(path).map_err(|_| missing(id))?),
                 StoredData::Memory(_) => None,
             };
+            entry.last_used_ms = now_ms;
             (entry.schema.clone(), stored, file)
         };
         let full_schema = with_row_number(&schema, row_number)?;
@@ -387,9 +521,9 @@ impl ResultStore {
         Ok(scan)
     }
 
-    /// One row per readable result, newest first.
+    /// One row per readable result, newest first. Listing is not a use.
     pub(crate) fn list(&self) -> RecordBatch {
-        let state = self.lock();
+        let state = self.lock_swept();
         let mut results: Vec<_> = state
             .entries
             .iter()
@@ -418,6 +552,8 @@ impl ResultStore {
             Arc::new(BooleanArray::from_iter(
                 results.iter().map(|(_, _, stored)| Some(stored.rows_exact)),
             )),
+            Arc::new(Int64Array::from_iter_values(results.iter().map(|(_, entry, _)| entry.last_used_ms))),
+            Arc::new(Int64Array::from_iter(results.iter().map(|(_, entry, _)| entry.expires_ms()))),
         ];
         RecordBatch::try_new(list_schema(), columns).expect("result list matches its schema")
     }
@@ -435,6 +571,8 @@ fn list_schema() -> SchemaRef {
         Field::new("created_ms", DataType::Int64, false),
         Field::new("elapsed_ms", DataType::Int64, false),
         Field::new("rows_exact", DataType::Boolean, false),
+        Field::new("last_used_ms", DataType::Int64, false),
+        Field::new("expires_ms", DataType::Int64, true),
     ]))
 }
 
@@ -460,7 +598,7 @@ fn exists(id: &str) -> String {
 }
 
 fn missing(id: &str) -> String {
-    format!("SQLNB_RESULT_MISSING: result '{id}' does not exist or was evicted")
+    format!("SQLNB_RESULT_MISSING: result '{id}' does not exist, expired or was evicted")
 }
 
 fn with_row_number(schema: &Schema, row_number: Option<&str>) -> Result<Schema, String> {
@@ -621,6 +759,7 @@ fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Resu
 
 struct SpillFile {
     file: File,
+    directory: PathBuf,
     temporary: PathBuf,
     path: PathBuf,
     /// The first free byte. A batch claims its place here and is written
@@ -641,6 +780,7 @@ impl SpillFile {
         }
         Ok(Self {
             file,
+            directory: directory.to_path_buf(),
             temporary,
             path: directory.join(format!("{id}.arrow")),
             end: AtomicU64::new(header.len() as u64),
@@ -777,7 +917,10 @@ impl ResultWriter {
                     state.batches.push(StoredBatch { key, rows, bytes, data: BatchData::Memory(batch) });
                     return Ok(());
                 }
-                self.spill(&mut state)?;
+                self.spill(&mut state, bytes)?;
+            } else {
+                let directory = &state.file.as_ref().expect("checked above").directory;
+                self.store.disk_room(directory, bytes, false)?;
             }
             state.file.clone().expect("a spilled result has a file")
         };
@@ -790,10 +933,12 @@ impl ResultWriter {
         Ok(())
     }
 
-    /// Moves the batches kept in memory into a new file. On failure they stay
-    /// in memory as what the result keeps.
-    fn spill(&self, state: &mut WriterState) -> Result<(), LimitReason> {
+    /// Moves the batches kept in memory into a new file that `incoming` more
+    /// bytes are about to follow into. On failure they stay in memory as what
+    /// the result keeps.
+    fn spill(&self, state: &mut WriterState, incoming: u64) -> Result<(), LimitReason> {
         let directory = self.store.session_directory().map_err(|_| LimitReason::Io)?;
+        self.store.disk_room(&directory, state.stored_bytes.saturating_add(incoming), true)?;
         let file = SpillFile::create(&directory, &self.id, &self.schema).map_err(|_| LimitReason::Io)?;
         let mut blocks = Vec::with_capacity(state.batches.len());
         for stored in &state.batches {
@@ -1045,6 +1190,20 @@ pub extern "C" fn sidequery_results_release() {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sidequery_result_defaults(
+    max_result_bytes: *mut u64,
+    max_cache_bytes: *mut u64,
+    ttl_seconds: *mut u64,
+) {
+    let defaults = ResultLimits::defaults(0);
+    unsafe {
+        max_result_bytes.write(defaults.max_result_bytes);
+        max_cache_bytes.write(defaults.max_cache_bytes);
+        ttl_seconds.write(defaults.ttl_ms.map_or(0, |ttl_ms| ttl_ms / 1000));
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sidequery_result_check(
     id: *const c_char,
     meta: *const c_char,
@@ -1065,6 +1224,7 @@ pub unsafe extern "C" fn sidequery_result_begin(
     head_rows: u64,
     max_result_bytes: u64,
     max_cache_bytes: u64,
+    ttl_seconds: u64,
     error_out: *mut *mut c_char,
 ) -> *mut ResultWriter {
     let mut writer = None;
@@ -1074,6 +1234,7 @@ pub unsafe extern "C" fn sidequery_result_begin(
             head_rows,
             max_result_bytes,
             max_cache_bytes,
+            ttl_ms: (ttl_seconds > 0).then(|| ttl_seconds.saturating_mul(1000)),
         };
         writer = Some(STORE.begin(unsafe { text(id, "id") }?, unsafe { text(meta, "meta") }?, schema, limits)?);
         Ok(())

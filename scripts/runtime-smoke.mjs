@@ -716,7 +716,7 @@ if (hasResultCache) {
   assert.equal(firstValue(await runSQL("select count(*) from duckdb_tables() where table_name = 'misplaced'")), 0);
   assert.equal(
     firstValue(await runSQL("select string_agg(column_name || ' ' || column_type, ', ') from (describe select * from sqlnb_results())")),
-    'id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN',
+    'id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN, last_used_ms BIGINT, expires_ms BIGINT',
   );
   assert.deepEqual(
     firstValue(await runSQL(`select list(r order by r.id) from (select id, rows, stored_rows, in_memory, limit_reason, meta, rows_exact from sqlnb_results() where id in ('${large}', '${small}')) r`)),
@@ -849,6 +849,46 @@ if (hasResultCache) {
   assert.deepEqual(resultFiles().filter((file) => file.includes(large)), []);
   await expectSQLError(`select * from sqlnb_result('${large}')`, /SQLNB_RESULT_MISSING:/);
   assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_results() where id = '${small}'`)), 1);
+  // A result is kept for a period after its last use: 24 hours unless the tee
+  // names another, NULL for as long as DuckDB runs. Reading it starts the
+  // period again; listing it does not.
+  const usage = async (number) => (await runSQL(
+    `select last_used_ms, expires_ms from sqlnb_results() where id = '${resultId(number)}'`,
+  ))[0];
+  const dayMs = 24 * 60 * 60 * 1000;
+  const hourMs = 60 * 60 * 1000;
+  const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+  assert.equal(firstValue(await runSQL(`select expires_ms - last_used_ms from sqlnb_results() where id = '${small}'`)), dayMs);
+  await runRows(`select * from sqlnb_result_tee((select i from range(30000) t(i)), id := '${resultId(20)}', ttl_seconds := 3600)`);
+  await runSQL(`select * from sqlnb_result_tee((select 1 as one), id := '${resultId(21)}', ttl_seconds := NULL)`);
+  const stored = await usage(20);
+  assert.equal(stored.expires_ms - stored.last_used_ms, hourMs);
+  assert.equal((await usage(21)).expires_ms, null);
+  await pause(20);
+  assert.deepEqual(await usage(20), stored);
+  assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_result('${resultId(20)}', first_row := 100, row_count := 5)`)), 5);
+  const read = await usage(20);
+  assert(read.last_used_ms > stored.last_used_ms, 'reading a result did not count as a use');
+  assert.equal(read.expires_ms - read.last_used_ms, hourMs);
+  // An expired result is gone like an evicted one, with its file.
+  await runRows(`select * from sqlnb_result_tee((select i from range(30000) t(i)), id := '${resultId(22)}', ttl_seconds := 1)`);
+  assert.deepEqual(resultFiles().filter((file) => file.includes(resultId(22))), [`${resultId(22)}.arrow`]);
+  await pause(1200);
+  assert.equal(firstValue(await runSQL(`select count(*) from sqlnb_results() where id = '${resultId(22)}'`)), 0);
+  assert.deepEqual(resultFiles().filter((file) => file.includes(resultId(22))), []);
+  await expectSQLError(`select * from sqlnb_result('${resultId(22)}')`, /SQLNB_RESULT_MISSING:/);
+  await expectSQLError(
+    `select * from sqlnb_result_tee((select 1), id := '${resultId(23)}', ttl_seconds := 0)`,
+    /ttl_seconds must be positive/,
+  );
+  // A cache limit below what is kept evicts the oldest results as soon as the
+  // next result begins, before it stores anything.
+  await runSQL(`select * from sqlnb_result_tee((select 1 as one), id := '${resultId(24)}', max_cache_bytes := 0)`);
+  assert.deepEqual(
+    await runSQL('select id, rows, stored_rows, limit_reason from sqlnb_results()'),
+    [{ id: resultId(24), rows: 1, stored_rows: 0, limit_reason: 'cache-bytes' }],
+  );
+  assert.deepEqual(resultFiles().filter((file) => file.endsWith('.arrow')), []);
 }
 
 const serversBeforeStop = await runSQL('select count(*) as count from quack_server_list()');

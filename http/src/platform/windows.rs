@@ -465,6 +465,17 @@ pub(crate) fn private_new_file(path: &Path) -> Result<File> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
+/// The space on the volume of `path`; `None` when the volume does not say.
+pub(crate) fn disk_space(path: &Path) -> Option<DiskSpace> {
+    use std::os::windows::ffi::OsStrExt;
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let read = unsafe {
+        GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, std::ptr::null_mut())
+    };
+    (read != 0).then_some(DiskSpace { available, total })
+}
 pub(crate) fn open_lease_file(path: &Path) -> Result<File> {
     checked(
         OpenOptions::new()
