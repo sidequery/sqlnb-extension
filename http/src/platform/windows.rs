@@ -208,6 +208,16 @@ pub(crate) fn open_file_at(parent: HANDLE, name: &CStr) -> Result<File> {
         FILE_NON_DIRECTORY_FILE,
     )
 }
+/// Creates a new file in `parent`; fails if the name exists, including as a reparse point.
+pub(crate) fn create_new_file_at(parent: HANDLE, name: &CStr) -> Result<File> {
+    open_at(
+        parent,
+        name,
+        FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    )
+}
 pub(crate) fn create_directory_at(parent: HANDLE, name: &CStr) -> Result<()> {
     open_at(
         parent,

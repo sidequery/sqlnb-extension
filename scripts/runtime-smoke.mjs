@@ -17,6 +17,7 @@ import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readPolicySmoke } from './read-policy-smoke.mjs';
 
 const values = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {
@@ -287,6 +288,7 @@ if (hasReadPolicy) {
     await runSQL("select * from sqlnb_read_query('select * from shared_table')"),
     [{ value: 7 }],
   );
+  await readPolicySmoke({ runSQL, expectSQLError, sqlLiteral, firstValue });
 }
 const startRows = await runSQL(
   `select sqlnb_start(assets := ${sqlLiteral(fixture)}, open_browser := false, notebook_root := ${sqlLiteral(notebookRoot)}, mcp := true) as status`,

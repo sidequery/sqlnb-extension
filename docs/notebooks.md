@@ -6,6 +6,20 @@
 
 The authenticated `GET /api/v1/recent-notebook` endpoint returns `{ "path": "relative.sqlnb" }`, or `{ "path": null }` when no readable recent notebook is available. The UI records a successful open or save using `PUT` to the same endpoint with `{ "path": "relative.sqlnb" }`. The path must identify an existing notebook within the configured root. This preference survives server restarts and port changes and is isolated by canonical notebook root under the OS cache's `sidequery/sqlnb-extension/notebooks` directory. It contains only the relative path; unavailable or corrupt preferences do not affect normal notebook file operations.
 
+## Uploaded data files
+
+A browser does not tell a page where a dropped file is stored, so the notebook UI imports a dropped CSV, Parquet or JSON file by uploading a copy. The bootstrap response advertises the endpoint as `"imports": { "endpoint": "/api/v1/import", "maxBytes": 1073741824, "folder": "/absolute/notebook/root/.sqlnb-imports" }`; servers without the field have no upload endpoint.
+
+`PUT /api/v1/import?name=<file name>` takes the raw file bytes as the request body and returns `201 { "path": "<absolute path>", "name": "<saved name>", "bytes": <count> }`. It uses the same capability and origin checks as the file API. Files are saved only in `.sqlnb-imports` directly under the notebook root, which is created on first use with a `.gitignore` of `*` and left out of the notebook listing:
+
+- The name must not contain a path separator or control character. Other characters outside letters, digits, spaces and `-_.()` become `_`, leading dots are removed, and the stem is cut to 120 characters. The extension must be `.csv`, `.tsv`, `.txt`, `.parquet`, `.json`, `.jsonl` or `.ndjson`, optionally followed by `.gz` or `.zst`.
+- An existing name is never replaced: the upload is saved as `name (2).csv`, `name (3).csv` and so on. The folder and file names are opened relative to the notebook root's descriptor without following symlinks, so a symlinked `.sqlnb-imports` is refused and a symlink inside it is neither written through nor deleted.
+- A declared `Content-Length` above `maxBytes` is refused with `413` before reading; the body is also counted while it streams. Bytes go to a temporary file that is renamed into place only after the whole body arrives and is synced; a refused, failed or aborted upload removes it.
+
+`PUT` also takes an optional `id`, a lowercase hyphenated UUID chosen by the client. An aborted request cannot cancel an upload whose whole body the server already received and saved, so a client that cancels also sends `DELETE /api/v1/import?id=<id>`: it deletes the file if that upload was saved, and otherwise makes the upload fail before it is saved. Publishing and cancelling are decided under one lock, so one of the two always wins cleanly. Ids are used once; the server remembers the latest 1024.
+
+`DELETE /api/v1/import?name=<saved name>` removes one uploaded file by the name the upload returned. Uploaded files otherwise stay until the user deletes them.
+
 ## DuckDB UI notebooks
 
 The local DuckDB UI launched by `duckdb -ui` stores its notebooks in a DuckDB
