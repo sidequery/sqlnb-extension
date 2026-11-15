@@ -22,6 +22,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/parallel/base_pipeline_event.hpp"
 
 #include <deque>
 #include <map>
@@ -160,7 +161,11 @@ public:
 };
 
 // A result collector that hands every call to the collector it wraps: the one
-// another extension installed for the statement.
+// another extension installed for the statement. The wrapped collector gets
+// its states with each call. Its own `sink_state` member stays unset, because
+// DuckDB sets that on the pipeline's sink, which is this operator; a collector
+// that read its own member instead of the state it is passed could not be
+// wrapped. Quack's and DuckDB's collectors do not.
 class DelegatingCollector : public PhysicalResultCollector {
 public:
   DelegatingCollector(PhysicalPlan &plan, PreparedStatementData &data, unique_ptr<PhysicalOperator> inner_p)
@@ -249,6 +254,8 @@ public:
 
   unique_ptr<GlobalSinkState> inner;
   sidequery_result_writer *writer = nullptr;
+  // The event that makes the result readable is in place.
+  bool publish_scheduled = false;
   atomic<bool> storing {true};
   atomic<idx_t> rows {0};
   // Numbers the stored batches of a result that has no executor batches.
@@ -277,6 +284,34 @@ public:
   // the passer makes, uses and combines it. It sets and clears the pointer
   // under head_lock, where a thread that leaves the head tests it.
   unique_ptr<LocalSinkState> head_inner;
+};
+
+// Makes a statement's result readable, as the last thing its last pipeline
+// does. The wrapped collector may finish its own work in events it inserts
+// while it finalizes: Quack sends a result's last batches from one, which
+// waits for the client and fails when the client is gone. A statement that
+// fails there has failed, and leaves no result. This event is inserted before
+// the wrapped collector finalizes, which puts it after every event inserted
+// later (Event::InsertEvent), so it only runs once those have finished.
+class TeePublishEvent : public BasePipelineEvent {
+public:
+  TeePublishEvent(Pipeline &pipeline, TeeGlobalState &global_p, bool rows_exact_p)
+      : BasePipelineEvent(pipeline), global(global_p), rows_exact(rows_exact_p) {
+  }
+
+  void Schedule() override {
+  }
+
+  void FinishEvent() override {
+    if (global.writer) {
+      sidequery_result_finish(global.writer, global.rows, rows_exact);
+      global.writer = nullptr;
+    }
+  }
+
+private:
+  TeeGlobalState &global;
+  const bool rows_exact;
 };
 
 class TeeLocalState : public LocalSinkState {
@@ -435,14 +470,14 @@ public:
   SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
     auto &global = input.global_state.template Cast<TeeGlobalState>();
-    OperatorSinkFinalizeInput inner {*global.inner, input.interrupt_state};
-    auto result = BASE::Finalize(pipeline, event, context, inner);
-    if (result != SinkFinalizeType::BLOCKED && global.writer) {
-      // Every thread has combined: the result becomes readable.
-      sidequery_result_finish(global.writer, global.rows, !StoppedAtLimit(global));
-      global.writer = nullptr;
+    if (!global.publish_scheduled) {
+      // Every thread has combined, so the counts are final. A wrapped
+      // collector that blocks is finalized again with the same event.
+      global.publish_scheduled = true;
+      event.InsertEvent(make_shared_ptr<TeePublishEvent>(pipeline, global, !StoppedAtLimit(global)));
     }
-    return result;
+    OperatorSinkFinalizeInput inner {*global.inner, input.interrupt_state};
+    return BASE::Finalize(pipeline, event, context, inner);
   }
 
   unique_ptr<QueryResult> GetResult(GlobalSinkState &state) const override {
