@@ -363,6 +363,23 @@ pub(crate) fn atomic_write_at(
     result
 }
 
+/// Creates a new private file in `parent`; fails if the name exists, including as a symlink.
+pub(crate) fn create_new_file_at(parent: libc::c_int, name: &CStr) -> std::io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 pub(crate) fn create_directory_at(parent: libc::c_int, name: &CStr) -> std::io::Result<()> {
     if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o755) } == 0 {
         Ok(())

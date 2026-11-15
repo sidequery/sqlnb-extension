@@ -18,6 +18,7 @@ mod windows_process;
 use platform::*;
 mod duckdb_ui;
 mod history;
+mod imports;
 mod mcp;
 mod project_git;
 use serde::{Deserialize, Serialize};
@@ -243,6 +244,7 @@ struct BootstrapResponse {
     engine: &'static str,
     duckdb_version: String,
     mcp_bridge: bool,
+    imports: imports::Capability,
 }
 
 #[derive(Serialize)]
@@ -1126,6 +1128,8 @@ impl NotebookStore {
             &mut files,
             &mut directories,
         )?;
+        files.retain(|entry| !imports::is_imports_entry(&entry.path));
+        directories.retain(|path| !imports::is_imports_entry(path));
         files.sort_by(|left, right| left.path.cmp(&right.path));
         directories.sort();
         Ok(NotebookListing { files, directories })
@@ -1723,6 +1727,7 @@ async fn bootstrap(
             engine: "native-duckdb",
             duckdb_version: state.duckdb_version.clone(),
             mcp_bridge: !state.mcp_token.is_empty(),
+            imports: imports::capability(&state),
         }),
     ))
 }
@@ -2301,6 +2306,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/file/move", post(move_file))
         .route("/api/v1/file/duplicate", post(duplicate_file))
         .route("/api/v1/folder", post(create_folder))
+        .route("/api/v1/import", imports::routes())
         .route("/quack", post(quack).options(options_quack));
     if !state.mcp_token.is_empty() {
         use rmcp::transport::streamable_http_server::{
