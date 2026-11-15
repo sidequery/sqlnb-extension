@@ -10,8 +10,13 @@ name = "sidequery_http"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+arrow-array = { version = "=60.1.0", default-features = false, features = ["ffi"] }
+arrow-data = { version = "=60.1.0", default-features = false }
+arrow-ipc = { version = "=60.1.0", default-features = false }
+arrow-schema = { version = "=60.1.0", default-features = false }
 axum = { version = "0.7", features = ["json", "query"] }
 bytes = "1"
+flatbuffers = "=25.12.19"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 http-body-util = "0.1"
 libc = "0.2"

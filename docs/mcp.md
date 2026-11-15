@@ -60,7 +60,8 @@ The read-only tool checks DuckDB's parsed statement, prepared-statement mutation
 properties, and bound plan. It rejects volatile functions and table functions it
 cannot establish are read-only. User-defined views and macros are rejected before
 binding because they can hide bind-time side effects; use the explicitly mutating
-`sidequery.sql.execute` tool when these are needed.
+`sidequery.sql.execute` tool when these are needed. Neither tool can use the
+notebook's [result cache](results.md); its functions report `POLICY_BLOCKED`.
 
 Live tools accept `notebook_path` to select a unique open notebook. Omit it only
 when exactly one browser session exists, or provide `session_id` to select a window.

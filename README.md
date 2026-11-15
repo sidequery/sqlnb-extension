@@ -56,6 +56,7 @@ To connect an MCP client, start with `mcp := true` and follow the
 - [Notebook storage](docs/notebooks.md) — files, DuckDB UI notebooks, history, and project Git.
 - [MCP reference](docs/mcp.md) — authentication, tools, and execution behavior.
 - [Instant SQL read policy](docs/instant-sql.md) — what previews automatically and why the rest needs Run.
+- [Result cache](docs/results.md) — storing and reading back complete notebook results.
 - [UI assets](docs/ui-assets.md) — custom frontends, updates, and the deployment contract.
 - [Release procedures](docs/releases.md) — maintainer builds, signing, and publication.
 

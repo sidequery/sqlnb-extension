@@ -408,6 +408,20 @@ pub(crate) fn private_new_file(path: &Path) -> std::io::Result<File> {
         .mode(0o600)
         .open(path)
 }
+/// The space on the volume of `path`; `None` when the volume does not say.
+pub(crate) fn disk_space(path: &Path) -> Option<DiskSpace> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block = stats.f_frsize as u64;
+    Some(DiskSpace {
+        available: (stats.f_bavail as u64).saturating_mul(block),
+        total: (stats.f_blocks as u64).saturating_mul(block),
+    })
+}
 pub(crate) fn open_lease_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)

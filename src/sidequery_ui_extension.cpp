@@ -37,6 +37,7 @@
 #include "duckdb/main/query_result_stream.hpp"
 #define SQLNB_HAS_RESULT_STREAM 1
 #include "sqlnb_read_policy.hpp"
+#include "sqlnb_results.hpp"
 #endif
 
 #if __has_include("duckdb/main/extension_repository_manager.hpp")
@@ -173,7 +174,11 @@ static void StopQuack(DatabaseInstance &database, const string &listen_uri) {
 // database -> extension state -> agent connection -> database reference cycle.
 class McpConnection {
 public:
-  explicit McpConnection(DatabaseInstance &database) : connection(database) {}
+  explicit McpConnection(DatabaseInstance &database) : connection(database) {
+#ifdef SQLNB_HAS_RESULT_STREAM
+    sqlnb_results::MarkAgentConnection(*connection.context);
+#endif
+  }
 
   static char *Query(void *context, uint64_t id, const char *sql, uint64_t max_rows,
                      uint64_t max_bytes, bool read_only) noexcept {
@@ -586,6 +591,10 @@ private:
 
 class SqlnbState : public StorageExtensionInfo {
 public:
+  // Results outlive their statements but not the last database using them.
+  SqlnbState() { sidequery_results_retain(); }
+  ~SqlnbState() override { sidequery_results_release(); }
+
   string Start(shared_ptr<DatabaseInstance> database, const string &remote_url, const string &local_dir,
                int port, bool open_browser, const string &notebook_root, bool mcp, connection_t caller) {
     std::lock_guard<std::mutex> guard(lock);
@@ -745,6 +754,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterDuckDBUINotebooks(loader);
 #ifdef SQLNB_HAS_RESULT_STREAM
   RegisterSQLNBReadPolicy(loader);
+  RegisterSQLNBResults(loader);
 #endif
   auto state_extension = make_shared_ptr<StorageExtension>();
   state_extension->storage_info = make_uniq<SqlnbState>();

@@ -1,0 +1,225 @@
+# Result cache (docs/results.md). Results are process-wide, so every id here is
+# unique to this file.
+require sqlnb
+
+# The statement returns its first rows; every row is stored.
+statement ok
+select * from sqlnb_result_tee((select i, i * 1.5 as amount, 'c-' || (i % 7) as label from range(50000) t(i)), id := 'a0000000000000000000000000000001', meta := '{"cell":1}');
+
+query I
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000002');
+----
+1
+
+# A result with more rows than its head is written to a file.
+statement ok
+select * from sqlnb_result_tee((select * from range(5000) t(i)), id := 'a0000000000000000000000000000003', head_rows := 3000);
+
+# The tee has to be the statement's whole output.
+statement error
+select count(*) from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000090');
+----
+returns its columns unchanged
+
+statement error
+create table misplaced as select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000091');
+----
+returns its columns unchanged
+
+statement error
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000092'), sqlnb_result_tee((select 2 as two), id := 'a0000000000000000000000000000093');
+----
+keeps one result
+
+query I
+select count(*) from sqlnb_results() where id >= 'a0000000000000000000000000000090';
+----
+0
+
+query TIIITTTI
+select id, rows, stored_rows, in_memory, limit_reason, meta, rows_exact, elapsed_ms >= 0 and created_ms > 0 from sqlnb_results() where id like 'a000000000000000000000000000000%' order by id;
+----
+a0000000000000000000000000000001	50000	50000	false	NULL	{"cell":1}	true	true
+a0000000000000000000000000000002	1	1	true	NULL	(empty)	true	true
+a0000000000000000000000000000003	5000	5000	false	NULL	(empty)	true	true
+
+query T
+select string_agg(column_name || ' ' || column_type, ', ') from (describe select * from sqlnb_results());
+----
+id VARCHAR, rows BIGINT, stored_rows BIGINT, stored_bytes BIGINT, in_memory BOOLEAN, limit_reason VARCHAR, meta VARCHAR, created_ms BIGINT, elapsed_ms BIGINT, rows_exact BOOLEAN, last_used_ms BIGINT, expires_ms BIGINT
+
+# Reading back returns the input, in order, with its original column types.
+query I
+select count(*) from ((select i, i * 1.5 as amount, 'c-' || (i % 7) as label from range(50000) t(i)) except all (select * from sqlnb_result('a0000000000000000000000000000001')));
+----
+0
+
+query I
+select bool_and(i = position) and count(*) = 50000 from sqlnb_result('a0000000000000000000000000000001', row_number := 'position');
+----
+true
+
+query TT
+select column_name, column_type from (describe select * from sqlnb_result('a0000000000000000000000000000001'));
+----
+i	BIGINT
+amount	DECIMAL(21,1)
+label	VARCHAR
+
+query III
+select count(*), min(i), max(position) from sqlnb_result('a0000000000000000000000000000001', first_row := 45000, row_count := 200, row_number := 'position');
+----
+200	45000	45199
+
+query I
+select count(*) from sqlnb_result('a0000000000000000000000000000001', first_row := 60000);
+----
+0
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000001', row_number := 'label');
+----
+must be a new, non-empty column name
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000099');
+----
+SQLNB_RESULT_MISSING:
+
+statement error
+select * from sqlnb_result_tee((select 1), id := 'a0000000000000000000000000000001');
+----
+SQLNB_RESULT_EXISTS:
+
+statement error
+select * from sqlnb_result_tee((select 1), id := 'not-an-id');
+----
+must be 32 lowercase hexadecimal characters
+
+statement error
+select * from sqlnb_result_tee((select 'a'::enum ('a', 'b') as mood), id := 'a0000000000000000000000000000004');
+----
+SQLNB_RESULT_UNSUPPORTED:
+
+# A failing statement leaves nothing readable and frees its id.
+statement error
+select * from sqlnb_result_tee((select case when i = 40000 then error('tee failed') else i end as i from range(50000) t(i)), id := 'a0000000000000000000000000000004');
+----
+tee failed
+
+query I
+select count(*) from sqlnb_results() where id = 'a0000000000000000000000000000004';
+----
+0
+
+query I
+select * from sqlnb_result_tee((select 1), id := 'a0000000000000000000000000000004');
+----
+1
+
+# A limit stops storing but every row is still counted; stop_at_limit also
+# stops reading, so rows becomes a lower bound.
+statement ok
+select * from sqlnb_result_tee((select i from range(100000000) t(i)), id := 'a0000000000000000000000000000005', max_result_bytes := 100000, stop_at_limit := true);
+
+statement ok
+select * from sqlnb_result_tee((select i from range(10000000) t(i)), id := 'a0000000000000000000000000000006', max_result_bytes := 100000);
+
+query TIITI
+select id, rows < 1000000, stored_rows > 0 and stored_rows <= rows, limit_reason, rows_exact from sqlnb_results() where id in ('a0000000000000000000000000000005', 'a0000000000000000000000000000006') order by id;
+----
+a0000000000000000000000000000005	true	true	result-bytes	false
+a0000000000000000000000000000006	false	true	result-bytes	true
+
+query I
+select rows from sqlnb_results() where id = 'a0000000000000000000000000000006';
+----
+10000000
+
+query I
+select (select count(*) = max(i) + 1 from sqlnb_result('a0000000000000000000000000000005')) and (select count(*) from sqlnb_result('a0000000000000000000000000000005')) = (select stored_rows from sqlnb_results() where id = 'a0000000000000000000000000000005');
+----
+true
+
+# The statement runs on all its threads and its rows are stored in its order.
+statement ok
+create table tee_scan as select i, hash(i) as h from range(3000000) t(i);
+
+statement ok
+select * from sqlnb_result_tee((select i, h from tee_scan where i % 3 = 0), id := 'a0000000000000000000000000000007');
+
+statement ok
+select * from sqlnb_result_tee((select i, h from tee_scan order by i desc), id := 'a0000000000000000000000000000008');
+
+query IIII
+select (select count(*) from sqlnb_result('a0000000000000000000000000000007')), (select bool_and(i = position * 3) from sqlnb_result('a0000000000000000000000000000007', row_number := 'position')), (select count(*) from sqlnb_result('a0000000000000000000000000000008')), (select bool_and(i = 2999999 - position) from sqlnb_result('a0000000000000000000000000000008', row_number := 'position'));
+----
+1000000	true	3000000	true
+
+# A verified read stopped at the limit keeps a prefix, whatever its threads stored.
+statement ok
+select * from sqlnb_result_tee((select i, h from tee_scan), id := 'a0000000000000000000000000000009', max_result_bytes := 4000000, stop_at_limit := true);
+
+query II
+select count(*) > 0, bool_and(i = position) from sqlnb_result('a0000000000000000000000000000009', row_number := 'position');
+----
+true	true
+
+statement ok
+select sqlnb_result_drop('a0000000000000000000000000000007'), sqlnb_result_drop('a0000000000000000000000000000008'), sqlnb_result_drop('a0000000000000000000000000000009');
+
+statement ok
+drop table tee_scan;
+
+query I
+select sqlnb_result_drop('a0000000000000000000000000000001');
+----
+true
+
+query I
+select sqlnb_result_drop('a0000000000000000000000000000001');
+----
+false
+
+statement error
+select * from sqlnb_result('a0000000000000000000000000000001');
+----
+SQLNB_RESULT_MISSING:
+
+query I
+select count(*) from sqlnb_results() where id = 'a0000000000000000000000000000002';
+----
+1
+
+# A result is kept for 24 hours after its last use unless the tee names another
+# period; NULL keeps it until DuckDB exits.
+query I
+select expires_ms - last_used_ms from sqlnb_results() where id = 'a0000000000000000000000000000002';
+----
+86400000
+
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000020', ttl_seconds := 3600);
+
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000021', ttl_seconds := NULL);
+
+query II
+select id, expires_ms - last_used_ms from sqlnb_results() where id in ('a0000000000000000000000000000020', 'a0000000000000000000000000000021') order by id;
+----
+a0000000000000000000000000000020	3600000
+a0000000000000000000000000000021	NULL
+
+statement error
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000022', ttl_seconds := 0);
+----
+ttl_seconds must be positive
+
+# A cache limit below what is kept evicts the oldest results when the next result begins.
+statement ok
+select * from sqlnb_result_tee((select 1 as one), id := 'a0000000000000000000000000000023', max_cache_bytes := 0);
+
+query IIIT
+select id, rows, stored_rows, limit_reason from sqlnb_results();
+----
+a0000000000000000000000000000023	1	0	cache-bytes

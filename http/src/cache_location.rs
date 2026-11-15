@@ -16,6 +16,10 @@ pub(super) fn notebook_state_path(root: &std::path::Path) -> Result<PathBuf, Str
         .join("recent-notebook.json"))
 }
 
+pub(super) fn results_directory() -> Result<PathBuf, String> {
+    Ok(cache_root()?.join("sidequery/sqlnb-extension/results"))
+}
+
 fn cache_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     let root = PathBuf::from(
