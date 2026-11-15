@@ -273,7 +273,9 @@ public:
   TeeLocalState *passer = nullptr;
   std::deque<TeeHeldChunk> queue;
   // The passer's state in the wrapped collector when its sink is parallel:
-  // that collector keeps the order of one state's rows, not of several.
+  // that collector keeps the order of one state's rows, not of several. Only
+  // the passer makes, uses and combines it. It sets and clears the pointer
+  // under head_lock, where a thread that leaves the head tests it.
   unique_ptr<LocalSinkState> head_inner;
 };
 
@@ -551,7 +553,9 @@ private:
     auto state = local.inner.get();
     if (this->ParallelSink()) {
       if (!global.head_inner) {
-        global.head_inner = BASE::GetLocalSinkState(context);
+        auto created = BASE::GetLocalSinkState(context);
+        lock_guard<mutex> guard(global.head_lock);
+        global.head_inner = std::move(created);
       }
       state = global.head_inner.get();
       state->partition_info = local.partition_info;
@@ -589,7 +593,9 @@ private:
           return false;
         }
         // A thread that starts later passes its chunks through a new state.
-        global.head_inner.reset();
+        guard.lock();
+        auto combined = std::move(global.head_inner);
+        guard.unlock();
         continue;
       }
       global.passer = nullptr;
