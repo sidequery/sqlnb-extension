@@ -237,6 +237,13 @@ struct TeeHeldChunk {
   idx_t bytes;
 };
 
+// The head rows an ended executor batch left waiting.
+struct TeeWaitingBatch {
+  vector<TeeHeldChunk> chunks;
+  idx_t rows = 0;
+  idx_t bytes = 0;
+};
+
 class TeeLocalState;
 
 class TeeGlobalState : public GlobalSinkState {
@@ -268,7 +275,15 @@ public:
   atomic<idx_t> min_batch {0};
   mutex head_lock;
   // Head rows of ended executor batches, waiting for the batches before them.
-  map<idx_t, vector<TeeHeldChunk>> waiting;
+  // Only as many batches wait as can still be part of the head: the lowest of
+  // them, up to the one with which they fill it. Without that, a slow lowest
+  // batch would leave a head's worth of rows here for every batch that ends.
+  map<idx_t, TeeWaitingBatch> waiting;
+  idx_t waiting_rows = 0;
+  idx_t waiting_bytes = 0;
+  // The highest executor batch whose rows can still be part of the head: the
+  // ended batches up to it fill the head. It only falls; set under head_lock.
+  atomic<idx_t> head_cutoff {DConstants::INVALID_INDEX};
   // Threads that have not combined.
   idx_t threads = 0;
   // Without executor batches the head is the chunks claimed first, in the
@@ -539,6 +554,12 @@ private:
       local.pass_chunk = true;
       return;
     }
+    if (local.current_batch.GetIndex() > global.head_cutoff) {
+      // Ended batches before this one fill the head. Nothing of this batch
+      // was passed on, so all it holds is its own rows.
+      DropHeld(local);
+      return;
+    }
     local.held.push_back(Copy(chunk, bytes));
   }
 
@@ -674,7 +695,9 @@ private:
     auto end = global.waiting.lower_bound(local.current_batch.GetIndex());
     vector<TeeHeldChunk> before;
     for (auto entry = global.waiting.begin(); entry != end; entry++) {
-      for (auto &held : entry->second) {
+      global.waiting_rows -= entry->second.rows;
+      global.waiting_bytes -= entry->second.bytes;
+      for (auto &held : entry->second.chunks) {
         before.push_back(std::move(held));
       }
     }
@@ -725,7 +748,14 @@ private:
   void CloseHead(TeeGlobalState &global, TeeLocalState &local) const {
     global.head_done = true;
     lock_guard<mutex> guard(global.head_lock);
+    ClearWaiting(global);
+  }
+
+  // Requires head_lock.
+  static void ClearWaiting(TeeGlobalState &global) {
     global.waiting.clear();
+    global.waiting_rows = 0;
+    global.waiting_bytes = 0;
   }
 
   // Passes on the chunks this thread holds for the head. False when the
@@ -797,12 +827,50 @@ private:
     WaitLocked(global, local);
   }
 
-  // Requires head_lock.
-  static void WaitLocked(TeeGlobalState &global, TeeLocalState &local) {
-    if (!local.held.empty()) {
-      global.waiting[local.current_batch.GetIndex()] = std::move(local.held);
+  // Requires head_lock. Leaves this thread's head rows waiting for the
+  // batches before its own, unless they can no longer be part of the head.
+  void WaitLocked(TeeGlobalState &global, TeeLocalState &local) const {
+    auto batch = local.current_batch.GetIndex();
+    if (!local.held.empty() && !global.head_done && batch <= global.head_cutoff) {
+      auto &waiting = global.waiting[batch];
+      for (auto &held : local.held) {
+        waiting.rows += held.chunk->size();
+        waiting.bytes += held.bytes;
+        global.waiting_rows += held.chunk->size();
+        global.waiting_bytes += held.bytes;
+        waiting.chunks.push_back(std::move(held));
+      }
+      TrimWaiting(global);
     }
     DropHeld(local);
+  }
+
+  // Requires head_lock. The head takes the rows that wait in batch order, and
+  // the batches still being read only add rows before them. So once the
+  // batches that wait fill the head without the highest of them, that one can
+  // never be part of it: it is dropped, and the batches after the highest one
+  // left stop holding rows back.
+  void TrimWaiting(TeeGlobalState &global) const {
+    auto fills = [&](idx_t rows, idx_t bytes) {
+      return rows >= parameters->head_rows || bytes >= parameters->head_bytes;
+    };
+    while (global.waiting.size() > 1) {
+      auto highest = std::prev(global.waiting.end());
+      auto rows = global.waiting_rows - highest->second.rows;
+      auto bytes = global.waiting_bytes - highest->second.bytes;
+      if (!fills(rows, bytes)) {
+        break;
+      }
+      global.waiting_rows = rows;
+      global.waiting_bytes = bytes;
+      global.waiting.erase(highest);
+    }
+    if (fills(global.waiting_rows, global.waiting_bytes)) {
+      auto highest = global.waiting.rbegin()->first;
+      if (highest < global.head_cutoff) {
+        global.head_cutoff = highest;
+      }
+    }
   }
 
   // The end of this thread's rows. Its head rows are passed on or left
@@ -869,7 +937,7 @@ private:
       if (!own_placed && entry.first > local.current_batch.GetIndex()) {
         place_own();
       }
-      for (auto &held : entry.second) {
+      for (auto &held : entry.second.chunks) {
         all.push_back(std::move(held));
       }
       last = MaxValue(last, entry.first);
@@ -877,7 +945,7 @@ private:
     if (!own_placed) {
       place_own();
     }
-    global.waiting.clear();
+    ClearWaiting(global);
     local.held = std::move(all);
     local.held_passed = 0;
     local.lowest = true;

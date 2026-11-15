@@ -67,6 +67,12 @@ Only the first rows need their order while the statement still runs. The thread
 on the lowest executor batch returns its rows at once. Every other thread keeps
 a copy of the first rows of its batch, at most `head_rows` rows or `head_bytes`
 bytes, until the batches before it have ended or enough rows were returned.
+A batch that ends before the batches below it leaves its copy waiting for them.
+Only the lowest such batches wait, up to the one with which they hold enough
+rows to be the first rows by themselves; batches after that one keep no copy.
+The memory this takes therefore does not grow with the number of batches: at
+most about twice `head_rows` rows or `head_bytes` bytes wait, besides one copy
+per thread.
 
 Results with at most `head_rows` rows and 1 MiB of Arrow buffers stay in memory.
 Larger results are written to `<id>.arrow.tmp` and renamed to `<id>.arrow` once
