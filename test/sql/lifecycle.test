@@ -100,6 +100,22 @@ select sqlnb_stop();
 ----
 false
 
+statement error
+select sqlnb_start(assets := '{WORKING_DIRECTORY}/test/fixtures/ui', browser_origin := 'http://notebooks.example.net:8443', open_browser := false);
+----
+browser_origin must be an exact HTTPS origin
+
+query TT
+select json_extract_string(status, '$.baseUrl'), starts_with(json_extract_string(status, '$.launchUrl'), 'https://notebooks.example.net:8443/#sidequery_token=')
+from (select sqlnb_start(assets := '{WORKING_DIRECTORY}/test/fixtures/ui', notebook_root := '{TEMP_DIR_ABSOLUTE}/sqlnb-lifecycle', browser_origin := 'https://notebooks.example.net:8443', open_browser := false) as status);
+----
+https://notebooks.example.net:8443	true
+
+query I
+select sqlnb_stop();
+----
+true
+
 statement ok
 set enable_external_access = false;
 

@@ -505,7 +505,8 @@ private:
 class SqlnbServer {
 public:
   SqlnbServer(shared_ptr<DatabaseInstance> database_p, const string &remote_url,
-              const string &local_dir, int requested_port, const string &notebook_root, bool mcp)
+              const string &local_dir, int requested_port, const string &notebook_root, bool mcp,
+              const string &browser_origin)
       : database(database_p), quack(StartQuack(*database_p)) {
     if (local_dir.empty() && remote_url.empty()) {
       StopQuack(*database_p, quack.listen_uri);
@@ -527,7 +528,8 @@ public:
                   ",\"token\":" + JSONEscape(quack.token) +
                   ",\"duckdbVersion\":" + JSONEscape(DuckDB::LibraryVersion()) +
                   ",\"notebookRoot\":" + JSONEscape(notebook_root) +
-                  ",\"mcpToken\":" + JSONEscape(mcp_token) + "}";
+                  ",\"mcpToken\":" + JSONEscape(mcp_token) +
+                  ",\"browserOrigin\":" + JSONEscape(browser_origin) + "}";
     char *error = nullptr;
     http_server = sidequery_http_start_with_query(config.c_str(), mcp_connection.get(),
                                                   McpConnection::Query, McpConnection::Interrupt,
@@ -547,7 +549,8 @@ public:
       StopQuack(*database_p, quack.listen_uri);
       throw IOException("SQLNB HTTP server returned an invalid port");
     }
-    origin = "http://127.0.0.1:" + std::to_string(actual_port);
+    origin = browser_origin.empty() ? "http://127.0.0.1:" + std::to_string(actual_port)
+                                    : browser_origin;
   }
 
   ~SqlnbServer() {
@@ -596,13 +599,14 @@ public:
   ~SqlnbState() override { sidequery_results_release(); }
 
   string Start(shared_ptr<DatabaseInstance> database, const string &remote_url, const string &local_dir,
-               int port, bool open_browser, const string &notebook_root, bool mcp, connection_t caller) {
+               int port, bool open_browser, const string &notebook_root, bool mcp,
+               const string &browser_origin, connection_t caller) {
     std::lock_guard<std::mutex> guard(lock);
     if (server) {
       throw InvalidInputException("SQLNB is already running");
     }
     auto candidate = make_uniq<SqlnbServer>(std::move(database), remote_url, local_dir, port,
-                                            notebook_root, mcp);
+                                            notebook_root, mcp, browser_origin);
     auto launch_url = candidate->LaunchURL();
     if (open_browser) {
       OpenBrowser(launch_url);
@@ -722,6 +726,7 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   auto open_browser = args.ColumnCount() > 3 ? args.data[3].GetValue(0).GetValue<bool>() : true;
   auto notebook_root = args.ColumnCount() > 4 ? args.data[4].GetValue(0).GetValue<string>() : string();
   auto mcp = args.ColumnCount() > 5 ? args.data[5].GetValue(0).GetValue<bool>() : false;
+  auto browser_origin = args.ColumnCount() > 6 ? args.data[6].GetValue(0).GetValue<string>() : string();
   if (port < 0 || port > 65535) {
     throw InvalidInputException("port must be between 0 and 65535");
   }
@@ -730,7 +735,7 @@ static void StartFunction(DataChunk &args, ExpressionState &state, Vector &resul
   }
   auto &database = *state.GetContext().db;
   result.SetValue(0, Value(GetState(database).Start(state.GetContext().db, remote_url, local_dir, port,
-                                                    open_browser, notebook_root, mcp,
+                                                    open_browser, notebook_root, mcp, browser_origin,
                                                     state.GetContext().GetConnectionId())));
   if (mcp) {
     state.GetContext().registered_state->GetOrCreate<McpOwnerCleanup>(
@@ -768,7 +773,8 @@ static void LoadInternal(ExtensionLoader &loader) {
        FunctionParameter("port", LogicalType::INTEGER, Value::INTEGER(0)),
        FunctionParameter("open_browser", LogicalType::BOOLEAN, Value::BOOLEAN(true)),
        FunctionParameter("notebook_root", LogicalType::VARCHAR, Value("")),
-       FunctionParameter("mcp", LogicalType::BOOLEAN, Value::BOOLEAN(false))},
+       FunctionParameter("mcp", LogicalType::BOOLEAN, Value::BOOLEAN(false)),
+       FunctionParameter("browser_origin", LogicalType::VARCHAR, Value(""))},
       LogicalType::VARCHAR);
   ScalarFunction sqlnb_start("sqlnb_start", std::move(sqlnb_start_signature), StartFunction);
   sqlnb_start.SetVolatile();

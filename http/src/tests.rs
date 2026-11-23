@@ -592,6 +592,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_browser_origin("")
+    }
+
+    fn with_browser_origin(browser_origin: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let assets = temp.path().join("assets");
         let root = temp.path().join("notebooks");
@@ -606,6 +610,7 @@ impl Fixture {
             duckdb_version: "test".into(),
             notebook_root: root.display().to_string(),
             mcp_token: String::new(),
+            browser_origin: browser_origin.into(),
         };
         let mut state = build_state(config, 4777).unwrap();
         Arc::get_mut(&mut state.notebooks).unwrap().recent_path =
@@ -641,6 +646,76 @@ async fn json_body(response: Response) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn browser_origin_requires_an_exact_https_origin() {
+    for invalid in [
+        "http://notebooks.example.net",
+        "https://notebooks.example.net/",
+        "https://notebooks.example.net/path",
+        "https://notebooks.example.net?query",
+        "https://notebooks.example.net#fragment",
+        "https://user@notebooks.example.net",
+        "https://*.example.net",
+        "https://notebooks.example.net:443",
+    ] {
+        assert!(
+            browser_origin_and_hosts(invalid, 4777).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn browser_origin_controls_host_origin_and_capability_checks() {
+    const ORIGIN: &str = "https://notebooks.example.net:8443";
+    const HOST: &str = "notebooks.example.net:8443";
+    let fixture = Fixture::with_browser_origin(ORIGIN);
+    let app = router(fixture.state.clone());
+    let request = |method, path, host, origin, authorization| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, host)
+            .header(header::ORIGIN, origin)
+            .header(header::AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let bootstrap = "/api/v1/bootstrap";
+    let token = "Bearer test-capability";
+    let response = app
+        .clone()
+        .oneshot(request("GET", bootstrap, HOST, ORIGIN, token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        ORIGIN
+    );
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/", "127.0.0.1:4777", ORIGIN, token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    for (method, path, origin, authorization) in [
+        ("GET", bootstrap, "http://127.0.0.1:4777", token),
+        ("GET", bootstrap, ORIGIN, "Bearer wrong-token"),
+        ("POST", "/quack", "https://other.example.net", token),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(method, path, HOST, origin, authorization))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test]
@@ -702,8 +777,8 @@ async fn recent_notebook_survives_new_store_and_port_and_tracks_new_selection() 
         NotebookStore::open(notebook_root(&fixture.root.display().to_string()).unwrap()).unwrap();
     reopened.recent_path = preference;
     fixture.state.notebooks = Arc::new(reopened);
-    fixture.state.port = 4888;
-    fixture.state.origin = "http://127.0.0.1:4888".into();
+    (fixture.state.origin, fixture.state.allowed_hosts) =
+        browser_origin_and_hosts("", 4888).unwrap();
     let mut request = fixture.request("GET", "/api/v1/recent-notebook", None);
     request
         .headers_mut()
@@ -1407,6 +1482,7 @@ fn history_polling_captures_external_changes_and_stops_with_server() {
         mcp_token: String::new(),
         duckdb_version: "test".into(),
         notebook_root: notebooks.display().to_string(),
+        browser_origin: String::new(),
     })
     .unwrap();
     let store = NotebookStore::open(notebooks.canonicalize().unwrap()).unwrap();

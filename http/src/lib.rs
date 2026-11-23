@@ -69,12 +69,14 @@ struct ServerConfig {
     notebook_root: String,
     #[serde(default)]
     mcp_token: String,
+    #[serde(default)]
+    browser_origin: String,
 }
 
 #[derive(Clone)]
 struct AppState {
-    port: u16,
     origin: String,
+    allowed_hosts: Vec<String>,
     token: String,
     duckdb_version: String,
     quack_url: Url,
@@ -334,6 +336,7 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
     if config.token.is_empty() {
         return Err("local UI capability must not be empty".into());
     }
+    let (origin, allowed_hosts) = browser_origin_and_hosts(&config.browser_origin, port)?;
     let mut quack_url = parse_loopback_url(&config.quack_url, "Quack URL")?;
     if quack_url.path().is_empty() || quack_url.path() == "/" {
         quack_url.set_path("/quack");
@@ -367,8 +370,8 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
     Ok(AppState {
-        port,
-        origin: format!("http://127.0.0.1:{port}"),
+        origin,
+        allowed_hosts,
         token: config.token,
         duckdb_version: config.duckdb_version,
         quack_url,
@@ -380,6 +383,26 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         mcp_query: None,
         mcp_shutdown: tokio_util::sync::CancellationToken::new(),
     })
+}
+
+fn browser_origin_and_hosts(configured: &str, port: u16) -> Result<(String, Vec<String>), String> {
+    if configured.is_empty() {
+        return Ok((
+            format!("http://127.0.0.1:{port}"),
+            vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
+        ));
+    }
+
+    let invalid = || {
+        "browser_origin must be an exact HTTPS origin, such as https://notebooks.example.net:4567"
+            .to_string()
+    };
+    let url = Url::parse(configured).map_err(|_| invalid())?;
+    let authority = configured.strip_prefix("https://").ok_or_else(invalid)?;
+    if configured != url.origin().ascii_serialization() || authority.contains('*') {
+        return Err(invalid());
+    }
+    Ok((configured.to_owned(), vec![authority.to_owned()]))
 }
 
 fn parse_loopback_url(value: &str, label: &str) -> Result<Url, String> {
@@ -1630,18 +1653,16 @@ async fn security_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let expected_127 = format!("127.0.0.1:{}", state.port);
-    let expected_localhost = format!("localhost:{}", state.port);
     let valid = request
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| host == expected_127 || host == expected_localhost);
+        .is_some_and(|host| state.allowed_hosts.iter().any(|allowed| allowed == host));
     if !valid {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_host",
-            "invalid local UI host",
+            "invalid SQLNB UI host",
         )
         .into_response();
     }
@@ -1689,7 +1710,7 @@ fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "invalid local UI capability or origin",
+            "invalid SQLNB UI capability or origin",
         ));
     }
     Ok(())
@@ -1703,7 +1724,7 @@ fn validate_origin(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "invalid local Quack origin",
+            "invalid SQLNB Quack origin",
         ));
     }
     Ok(())
@@ -2316,10 +2337,7 @@ fn router(state: AppState) -> Router {
         let service_state = state.clone();
         let mut config = StreamableHttpServerConfig::default();
         config.cancellation_token = state.mcp_shutdown.clone();
-        config.allowed_hosts = vec![
-            format!("127.0.0.1:{}", state.port),
-            format!("localhost:{}", state.port),
-        ];
+        config.allowed_hosts = state.allowed_hosts.clone();
         config.allowed_origins = vec![state.origin.clone()];
         let service = StreamableHttpService::new(
             move || Ok(mcp::McpServer(service_state.clone())),
