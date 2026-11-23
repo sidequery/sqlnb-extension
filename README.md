@@ -47,6 +47,22 @@ select sqlnb_start(
 );
 ```
 
+To serve SQLNB through a trusted HTTPS reverse proxy, configure the exact browser
+origin, including any non-default port and without a trailing slash:
+
+```sql
+select sqlnb_start(
+    port := 4567,
+    open_browser := false,
+    browser_origin := 'https://notebooks.example.net:8443'
+);
+```
+
+SQLNB still binds to loopback. Forward the origin's entire URL path to the
+configured loopback port and preserve the browser's `Host` and `Origin` headers.
+The returned launch URL uses the configured HTTPS origin and includes the
+session token. Allow only trusted users to reach the proxy.
+
 To connect an MCP client, start with `mcp := true` and follow the
 [MCP setup guide](docs/mcp.md). MCP is disabled by default.
 
