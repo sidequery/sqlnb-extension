@@ -16,6 +16,7 @@ mod platform;
 #[cfg(windows)]
 mod windows_process;
 use platform::*;
+mod browser_auth;
 mod duckdb_ui;
 mod history;
 mod imports;
@@ -71,12 +72,15 @@ struct ServerConfig {
     mcp_token: String,
     #[serde(default)]
     browser_origin: String,
+    #[serde(default)]
+    browser_auth_file: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     origin: String,
     allowed_hosts: Vec<String>,
+    browser_auth: browser_auth::BrowserAuth,
     token: String,
     duckdb_version: String,
     quack_url: Url,
@@ -337,6 +341,7 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
         return Err("local UI capability must not be empty".into());
     }
     let (origin, allowed_hosts) = browser_origin_and_hosts(&config.browser_origin, port)?;
+    let browser_auth = browser_auth::BrowserAuth::load(&config.browser_auth_file, &origin)?;
     let mut quack_url = parse_loopback_url(&config.quack_url, "Quack URL")?;
     if quack_url.path().is_empty() || quack_url.path() == "/" {
         quack_url.set_path("/quack");
@@ -372,6 +377,7 @@ fn build_state(config: ServerConfig, port: u16) -> Result<AppState, String> {
     Ok(AppState {
         origin,
         allowed_hosts,
+        browser_auth,
         token: config.token,
         duckdb_version: config.duckdb_version,
         quack_url,
@@ -2302,6 +2308,12 @@ async fn static_asset(
 fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/api/v1/bootstrap", get(bootstrap))
+        .route(
+            "/api/v1/session",
+            get(browser_auth::methods)
+                .post(browser_auth::sign_in)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/api/v1/files", get(list_files))
         .route("/api/v1/git", get(git_status))
         .route("/api/v1/git/diff", get(git_diff))
