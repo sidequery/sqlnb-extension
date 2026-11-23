@@ -81,7 +81,10 @@ only its hash in the JSON. Access-key sign-in remembers the browser for seven
 days. With a trusted proxy, the ordinary URL opens the notebook for the
 specified identity. The proxy must authenticate the user and remove incoming
 copies of the identity header before setting its own. Keep untrusted clients
-away from the loopback listener. Existing launch links work with either mode.
+away from the loopback listener. SQLNB tries an existing sign-in automatically
+and shows the access-key form if that method is configured and a browser still
+needs to sign in. Deployments with neither method use launch links. A valid
+launch link can still open SQLNB with any configuration.
 
 To connect an MCP client, start with `mcp := true` and follow the
 [MCP setup guide](docs/mcp.md). MCP is disabled by default.
