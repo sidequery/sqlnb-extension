@@ -611,6 +611,7 @@ impl Fixture {
             notebook_root: root.display().to_string(),
             mcp_token: String::new(),
             browser_origin: browser_origin.into(),
+            browser_auth_file: String::new(),
         };
         let mut state = build_state(config, 4777).unwrap();
         Arc::get_mut(&mut state.notebooks).unwrap().recent_path =
@@ -716,6 +717,112 @@ async fn browser_origin_controls_host_origin_and_capability_checks() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+}
+
+#[tokio::test]
+async fn browser_sign_in_accepts_configured_methods_and_renews_after_restart() {
+    const ORIGIN: &str = "https://notebooks.example.net:8443";
+    const HOST: &str = "notebooks.example.net:8443";
+    let mut fixture = Fixture::with_browser_origin(ORIGIN);
+    let access_key = "1".repeat(64);
+    let config = fixture._temp.path().join("auth.json");
+    fs::write(
+        &config,
+        json!({
+            "accessKeySha256": format!("{:x}", Sha256::digest(&access_key)),
+            "trustedProxy": {"header": "X-Authenticated-User", "value": "owner@example.net"},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        browser_auth::BrowserAuth::load(config.to_str().unwrap(), "http://127.0.0.1:4777").is_err()
+    );
+    fixture.state.browser_auth =
+        browser_auth::BrowserAuth::load(config.to_str().unwrap(), ORIGIN).unwrap();
+    let app = router(fixture.state.clone());
+    let request = |origin: &str, body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/session")
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let info = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/session")
+                .header(header::HOST, HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(info).await,
+        json!({"accessKey": true, "trustedProxy": true})
+    );
+
+    for (origin, body) in [
+        (ORIGIN, json!({})),
+        (ORIGIN, json!({"accessKey": "2".repeat(64)})),
+        (
+            "https://foreign.example.net",
+            json!({"accessKey": access_key}),
+        ),
+    ] {
+        let response = app.clone().oneshot(request(origin, body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+    for identity in ["other@example.net", "owner@example.net"] {
+        let mut proxy = request(ORIGIN, json!({}));
+        proxy.headers_mut().insert(
+            "x-authenticated-user",
+            HeaderValue::from_str(identity).unwrap(),
+        );
+        let response = app.clone().oneshot(proxy).await.unwrap();
+        let expected = if identity == "owner@example.net" {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_eq!(response.status(), expected);
+    }
+
+    let response = app
+        .oneshot(request(ORIGIN, json!({"accessKey": access_key})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(cookie.contains("Secure; HttpOnly; SameSite=Strict"));
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    assert_eq!(
+        json_body(response).await,
+        json!({"launchCapability":"test-capability"})
+    );
+
+    // A restart rotates the Quack token while keeping the configured access key.
+    fixture.state.token = "rotated-capability".into();
+    let mut renewed = request(ORIGIN, json!({}));
+    renewed
+        .headers_mut()
+        .insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    let response = router(fixture.state.clone())
+        .oneshot(renewed)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({"launchCapability":"rotated-capability"})
+    );
 }
 
 #[tokio::test]
@@ -1483,6 +1590,7 @@ fn history_polling_captures_external_changes_and_stops_with_server() {
         duckdb_version: "test".into(),
         notebook_root: notebooks.display().to_string(),
         browser_origin: String::new(),
+        browser_auth_file: String::new(),
     })
     .unwrap();
     let store = NotebookStore::open(notebooks.canonicalize().unwrap()).unwrap();

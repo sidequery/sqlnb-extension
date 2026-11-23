@@ -1472,6 +1472,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "reqwest",
+ "ring",
  "rmcp",
  "serde",
  "serde_json",

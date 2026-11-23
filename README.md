@@ -63,6 +63,29 @@ configured loopback port and preserve the browser's `Host` and `Origin` headers.
 The returned launch URL uses the configured HTTPS origin and includes the
 session token. Allow only trusted users to reach the proxy.
 
+For a stable browser URL, pass `browser_auth_file := '/path/to/auth.json'` along
+with `browser_origin`. The file can configure either or both sign-in methods:
+
+```json
+{
+  "accessKeySha256": "<lowercase SHA-256 of a 64-character lowercase hex key>",
+  "trustedProxy": {
+    "header": "X-Authenticated-User",
+    "value": "owner@example.net"
+  }
+}
+```
+
+Generate an access key with `openssl rand -hex 32`, store it securely, and put
+only its hash in the JSON. Access-key sign-in remembers the browser for seven
+days. With a trusted proxy, the ordinary URL opens the notebook for the
+specified identity. The proxy must authenticate the user and remove incoming
+copies of the identity header before setting its own. Keep untrusted clients
+away from the loopback listener. SQLNB tries an existing sign-in automatically
+and shows the access-key form if that method is configured and a browser still
+needs to sign in. Deployments with neither method use launch links. A valid
+launch link can still open SQLNB with any configuration.
+
 To connect an MCP client, start with `mcp := true` and follow the
 [MCP setup guide](docs/mcp.md). MCP is disabled by default.
 

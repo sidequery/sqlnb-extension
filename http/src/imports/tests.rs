@@ -28,6 +28,7 @@ fn config(temp: &TempDir, port: u16) -> ServerConfig {
         notebook_root: temp.path().join("notebooks").display().to_string(),
         mcp_token: String::new(),
         browser_origin: String::new(),
+        browser_auth_file: String::new(),
     }
 }
 
